@@ -1,4 +1,4 @@
-# TV Remote for Android TV
+# Remote for Android TV
 
 [![Android CI](https://github.com/harimoradiya/TV-Remote-for-Android-TV/actions/workflows/android.yml/badge.svg)](https://github.com/harimoradiya/TV-Remote-for-Android-TV/actions/workflows/android.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
