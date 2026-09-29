@@ -36,7 +36,20 @@ data class RemoteShortcutApp(
     val label: String,
     val mark: String,
     val accent: Color,
-    val accentSecondary: Color = accent
+    val accentSecondary: Color = accent,
+    val intentUri: String? = null,
+    val isCustom: Boolean = false
+)
+
+fun CustomShortcut.toRemoteShortcutApp(): RemoteShortcutApp = RemoteShortcutApp(
+    id = id,
+    launchName = intentUri,
+    label = label,
+    mark = mark.ifBlank { label.take(2).uppercase() },
+    accent = accentColor,
+    accentSecondary = accentColor,
+    intentUri = intentUri,
+    isCustom = true
 )
 
 private val defaultRemoteShortcutApps = listOf(
@@ -108,29 +121,49 @@ private val defaultRemoteShortcutApps = listOf(
 
 fun defaultRemoteShortcutOrder(): List<String> = defaultRemoteShortcutApps.map(RemoteShortcutApp::id)
 
-fun decodeRemoteShortcutOrder(raw: String?): List<String> {
-    if (raw.isNullOrBlank()) return defaultRemoteShortcutOrder()
-    val knownIds = defaultRemoteShortcutApps.map(RemoteShortcutApp::id).toSet()
-    val savedIds = raw.split(',')
+fun getAllKnownShortcutApps(customShortcuts: List<CustomShortcut> = emptyList()): List<RemoteShortcutApp> =
+    defaultRemoteShortcutApps + customShortcuts.map { it.toRemoteShortcutApp() }
+
+fun decodeRemoteShortcutOrder(
+    raw: String?,
+    customShortcuts: List<CustomShortcut> = emptyList()
+): List<String> {
+    val defaultIds = defaultRemoteShortcutApps.map(RemoteShortcutApp::id)
+    val customIds = customShortcuts.map(CustomShortcut::id)
+    val allKnownIds = (defaultIds + customIds).toSet()
+
+    if (raw == null) {
+        return defaultIds + customIds
+    }
+    val savedOrder = raw.split(',')
         .map(String::trim)
         .filter(String::isNotBlank)
-        .filter { it in knownIds }
+        .filter { id ->
+            if (allKnownIds.isNotEmpty()) id in allKnownIds
+            else (id in defaultIds || id.length > 8)
+        }
         .distinct()
-    return (savedIds + defaultRemoteShortcutApps.map(RemoteShortcutApp::id)).distinct()
+
+    val missingCustom = customIds.filter { it !in savedOrder }
+    return savedOrder + missingCustom
 }
 
-fun encodeRemoteShortcutOrder(order: List<String>): String = decodeRemoteShortcutOrder(
+fun encodeRemoteShortcutOrder(order: List<String>): String =
     order.joinToString(",")
-).joinToString(",")
 
-fun resolveRemoteShortcutApps(order: List<String>): List<RemoteShortcutApp> {
-    val appsById = defaultRemoteShortcutApps.associateBy(RemoteShortcutApp::id)
-    return decodeRemoteShortcutOrder(order.joinToString(","))
-        .mapNotNull(appsById::get)
+fun resolveRemoteShortcutApps(
+    order: List<String>,
+    customShortcuts: List<CustomShortcut> = emptyList()
+): List<RemoteShortcutApp> {
+    val allApps = getAllKnownShortcutApps(customShortcuts)
+    val appsById = allApps.associateBy(RemoteShortcutApp::id)
+    val orderSet = order.toSet()
+    val fullOrder = order + customShortcuts.map { it.id }.filter { it !in orderSet }
+    return fullOrder.mapNotNull(appsById::get)
 }
 
 fun moveRemoteShortcutOrderItem(order: List<String>, fromIndex: Int, direction: Int): List<String> {
-    val resolved = decodeRemoteShortcutOrder(order.joinToString(",")).toMutableList()
+    val resolved = order.toMutableList()
     val targetIndex = fromIndex + direction
     if (fromIndex !in resolved.indices || targetIndex !in resolved.indices) {
         return resolved
@@ -139,3 +172,5 @@ fun moveRemoteShortcutOrderItem(order: List<String>, fromIndex: Int, direction: 
     resolved.add(targetIndex, movedItem)
     return resolved
 }
+
+fun getDefaultRemoteShortcutApps(): List<RemoteShortcutApp> = defaultRemoteShortcutApps

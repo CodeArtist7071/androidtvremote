@@ -30,13 +30,16 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -84,7 +87,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 @Composable
 fun RemoteControlSettingsScreenPreview() {
     RemoteControlSettingsScreen(
-        defaultPadMode = RemotePadMode.Touchpad,
+        defaultPadMode = RemotePadMode.DPad,
         hapticsEnabled = true,
         keepScreenAwake = true,
         remoteShelfMode = RemoteShelfMode.Applications,
@@ -94,7 +97,9 @@ fun RemoteControlSettingsScreenPreview() {
         onHapticsChange = {},
         onKeepScreenAwakeChange = {},
         onRemoteShelfModeChange = {},
-        onRemoteAppOrderChange = {}
+        onOpenQuickLaunchOrder = {},
+        onOpenManageShortcuts = {},
+        onOpenCustomizeLayout = {}
     )
 }
 
@@ -111,10 +116,10 @@ fun RemoteControlSettingsScreen(
     onHapticsChange: (Boolean) -> Unit,
     onKeepScreenAwakeChange: (Boolean) -> Unit,
     onRemoteShelfModeChange: (RemoteShelfMode) -> Unit,
-    onRemoteAppOrderChange: (List<String>) -> Unit,
+    onOpenQuickLaunchOrder: () -> Unit = {},
+    onOpenManageShortcuts: () -> Unit = {},
+    onOpenCustomizeLayout: () -> Unit = {},
 ) {
-    var showAppOrderDialog by rememberSaveable { mutableStateOf(false) }
-    val context = LocalContext.current
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(
         rememberTopAppBarState()
     )
@@ -208,329 +213,31 @@ fun RemoteControlSettingsScreen(
                             "Set the app order now for when you use the Applications strip"
                         },
                         icon = Icons.Filled.Apps,
-                        onClick = {
-                            showAppOrderDialog = true
-                        }
+                        onClick = onOpenQuickLaunchOrder
                     )
                 }
-            }
-        }
-    }
-
-    if (showAppOrderDialog) {
-        RemoteAppOrderDialog(
-            apps = remoteApps,
-            onDismiss = { showAppOrderDialog = false },
-            onSave = { reorderedApps ->
-                onRemoteAppOrderChange(reorderedApps.map(RemoteShortcutApp::id))
-                showAppOrderDialog = false
-            }
-        )
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Drag state holder
-// ─────────────────────────────────────────────────────────────────────────────
-private class DragDropState(
-    val items: SnapshotStateList<RemoteShortcutApp>
-) {
-    var draggingId    by mutableStateOf<String?>(null)
-    var dragOffsetPx  by mutableFloatStateOf(0f)
-    var itemHeightPx  by mutableFloatStateOf(0f)   // measured at runtime
-
-    /** True while a drag is in progress */
-    val isDragging get() = draggingId != null
-
-    fun onDragStart(id: String) {
-        draggingId   = id
-        dragOffsetPx = 0f
-    }
-
-    fun onDrag(deltaY: Float) {
-        if (draggingId == null) return
-        dragOffsetPx += deltaY
-
-        val step = itemHeightPx.takeIf { it > 0f } ?: return
-        var idx  = items.indexOfFirst { it.id == draggingId } .takeIf { it >= 0 } ?: return
-
-        // Swap DOWN
-        while (dragOffsetPx > step / 2f && idx < items.lastIndex) {
-            val moved = items.removeAt(idx)
-            items.add(idx + 1, moved)
-            dragOffsetPx -= step
-            idx++
-        }
-        // Swap UP
-        while (dragOffsetPx < -step / 2f && idx > 0) {
-            val moved = items.removeAt(idx)
-            items.add(idx - 1, moved)
-            dragOffsetPx += step
-            idx--
-        }
-    }
-
-    fun onDragEnd() {
-        draggingId   = null
-        dragOffsetPx = 0f
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Dialog  — nearly full-screen so all items are visible without scrolling
-// ─────────────────────────────────────────────────────────────────────────────
-@Composable
-fun RemoteAppOrderDialog(
-    apps: List<RemoteShortcutApp>,
-    onDismiss: () -> Unit,
-    onSave: (List<RemoteShortcutApp>) -> Unit
-) {
-    val workingApps = remember(apps) { apps.toMutableStateList() }
-    val dragState   = remember(workingApps) { DragDropState(workingApps) }
-    val listState   = rememberLazyListState()
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows  = false
-        )
-    ) {
-        // Outer box fills the screen; padding reveals the dimmed scrim behind
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 28.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .fillMaxHeight(),           // ← fills almost all vertical space
-                shape           = RoundedCornerShape(32.dp),
-                color           = MaterialTheme.colorScheme.surfaceContainerHigh,
-                tonalElevation  = 8.dp,
-                shadowElevation = 24.dp
-            ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-
-                    // ── Gradient header ──────────────────────────────────────
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(
-                                Brush.verticalGradient(
-                                    listOf(
-                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
-                                        MaterialTheme.colorScheme.surfaceContainerHigh
-                                    )
-                                )
-                            )
-                            .padding(start = 24.dp, end = 12.dp, top = 24.dp, bottom = 20.dp)
-                    ) {
-                        Column(modifier = Modifier.align(Alignment.CenterStart)) {
-                            Text(
-                                text       = "Quick-launch order",
-                                style      = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                color      = MaterialTheme.colorScheme.onSurface
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text  = "Long-press ≡ then drag to reorder",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(
-                            onClick  = onDismiss,
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
-                        ) {
-                            Icon(Icons.Filled.Close, contentDescription = "Close")
-                        }
-                    }
-
-                    HorizontalDivider(
-                        color     = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-                        thickness = 1.dp
+                item {
+                    SettingItemRow(
+                        title = "Custom shortcuts",
+                        desc = "Add, edit, or delete your own app shortcuts",
+                        icon = Icons.Filled.AddCircle,
+                        onClick = onOpenManageShortcuts
                     )
-
-                    // ── List — weight(1f) expands to fill all remaining space ─
-                    LazyColumn(
-                        state   = listState,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),            // ← key: pushes footer to bottom
-                        contentPadding          = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                        verticalArrangement     = Arrangement.spacedBy(8.dp),
-                        userScrollEnabled       = !dragState.isDragging
-                    ) {
-                        itemsIndexed(
-                            items = workingApps,
-                            key   = { _, app -> app.id }
-                        ) { index, app ->
-                            DraggableAppItem(
-                                app       = app,
-                                index     = index,
-                                dragState = dragState
-                            )
-                        }
-                    }
-
-                    HorizontalDivider(
-                        color     = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-                        thickness = 1.dp
+                }
+                item {
+                    SettingItemRow(
+                        title = "Customize layout",
+                        desc = "Rearrange controls and change rockers",
+                        icon = Icons.Filled.Dashboard,
+                        onClick = onOpenCustomizeLayout
                     )
-
-                    // ── Footer ────────────────────────────────────────────────
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp, vertical = 16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
-                        verticalAlignment     = Alignment.CenterVertically
-                    ) {
-
-                        OutlinedButton(onClick = onDismiss) { Text("Cancel") }
-                        Button(onClick = { onSave(workingApps.toList()) }) { Text("Save order") }
-                    }
                 }
             }
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Single draggable row
-// ─────────────────────────────────────────────────────────────────────────────
-@Composable
-private fun DraggableAppItem(
-    app: RemoteShortcutApp,
-    index: Int,
-    dragState: DragDropState
-) {
-    val density    = LocalDensity.current
-    val isDragging = dragState.draggingId == app.id
 
-    val offsetDp by animateDpAsState(
-        targetValue   = if (isDragging) with(density) { dragState.dragOffsetPx.toDp() } else 0.dp,
-        animationSpec = spring(stiffness = if (isDragging) 600f else 1800f),
-        label         = "offset_${app.id}"
-    )
-    val elevation by animateDpAsState(
-        targetValue   = if (isDragging) 10.dp else 0.dp,
-        animationSpec = spring(stiffness = 400f),
-        label         = "elevation_${app.id}"
-    )
-    val scale by animateFloatAsState(
-        targetValue   = if (isDragging) 1.03f else 1f,
-        animationSpec = spring(stiffness = 400f),
-        label         = "scale_${app.id}"
-    )
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .onSizeChanged { size ->
-                // Capture actual item height (includes spacing gap via Arrangement)
-                if (size.height > 0 && dragState.itemHeightPx == 0f)
-                    dragState.itemHeightPx = size.height.toFloat()
-            }
-            .offset(y = offsetDp)
-            .zIndex(if (isDragging) 2f else 0f)
-            .shadow(elevation = elevation, shape = RoundedCornerShape(18.dp), clip = false)
-            .clip(RoundedCornerShape(18.dp))
-            .background(
-                if (isDragging) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.96f)
-                else MaterialTheme.colorScheme.surfaceContainerLow
-            )
-            .graphicsLayer { scaleX = scale; scaleY = scale }
-            .padding(horizontal = 18.dp, vertical = 16.dp),
-        verticalAlignment     = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-
-        // ── Position badge ────────────────────────────────────────────────────
-        Surface(
-            shape    = CircleShape,
-            color    = if (isDragging) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.secondaryContainer,
-            modifier = Modifier.size(32.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                Text(
-                    text       = "${index + 1}",
-                    style      = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color      = if (isDragging) MaterialTheme.colorScheme.onPrimary
-                    else MaterialTheme.colorScheme.onSecondaryContainer
-                )
-            }
-        }
-
-        // ── App label ─────────────────────────────────────────────────────────
-        Text(
-            text       = app.label,
-            modifier   = Modifier.weight(1f),
-            style      = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            color      = if (isDragging) MaterialTheme.colorScheme.onPrimaryContainer
-            else MaterialTheme.colorScheme.onSurface
-        )
-
-        // ── "First" chip on position 0 while not dragging ─────────────────────
-        if (index == 0 && !dragState.isDragging) {
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.tertiaryContainer
-            ) {
-                Text(
-                    text       = "First",
-                    modifier   = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                    style      = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Medium,
-                    color      = MaterialTheme.colorScheme.onTertiaryContainer
-                )
-            }
-        }
-
-        // ── Drag handle ───────────────────────────────────────────────────────
-        Box(
-            modifier = Modifier
-                .size(44.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(
-                    if (isDragging)
-                        MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.15f)
-                    else
-                        MaterialTheme.colorScheme.surface.copy(alpha = 0.8f)
-                )
-                .pointerInput(app.id) {
-                    detectDragGesturesAfterLongPress(
-                        onDragStart  = { dragState.onDragStart(app.id) },
-                        onDrag       = { change, dragAmount ->
-                            change.consume()
-                            dragState.onDrag(dragAmount.y)
-                        },
-                        onDragEnd    = { dragState.onDragEnd() },
-                        onDragCancel = { dragState.onDragEnd() }
-                    )
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector        = Icons.Filled.DragHandle,
-                contentDescription = "Drag to reorder ${app.label}",
-                modifier           = Modifier.size(22.dp),
-                tint = if (isDragging) MaterialTheme.colorScheme.onPrimaryContainer
-                else MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
 
 
 @Composable

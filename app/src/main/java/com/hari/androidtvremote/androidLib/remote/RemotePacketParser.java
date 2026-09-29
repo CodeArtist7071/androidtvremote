@@ -28,6 +28,13 @@ public class RemotePacketParser extends PacketParser {
     }
 
     @Override
+    protected void onStreamClosed() {
+        if (mRemoteListener != null) {
+            mRemoteListener.onDisconnected();
+        }
+    }
+
+    @Override
     public void messageBufferReceived(byte[] buf) {
         System.out.println(Arrays.toString(buf));
         Remotemessage.RemoteMessage remoteMessage = null;

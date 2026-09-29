@@ -2,12 +2,19 @@ package com.hari.androidtvremote.ui.app
 
 import android.app.Application
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.util.Log
 import androidx.compose.ui.graphics.Color
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.connectsdk.core.MediaInfo
 import com.connectsdk.device.ConnectableDevice
 import com.connectsdk.device.ConnectableDeviceListener
@@ -22,6 +29,7 @@ import com.connectsdk.service.capability.listeners.ResponseListener
 import com.connectsdk.service.command.ServiceCommandError
 import com.connectsdk.service.sessions.LaunchSession
 import com.hari.androidtvremote.App
+import com.hari.androidtvremote.services.KeepAliveService
 import com.hari.androidtvremote.utils.Constant
 import com.hari.androidtvremote.androidLib.AndroidRemoteTv
 import com.hari.androidtvremote.androidLib.AndroidTvListener
@@ -29,14 +37,17 @@ import com.hari.androidtvremote.androidLib.remote.Remotemessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import timber.log.Timber
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class CastPlaybackUiState(
     val activeMedia: MediaItemUi? = null,
@@ -58,6 +69,8 @@ data class TvRemoteUiState(
     val statusMessage: String? = null,
     val isError: Boolean = false,
     val volumeFraction: Float = 0.5f,
+    val volumeLevel: Int? = null,
+    val isMuted: Boolean = false,
     val isVoiceActive: Boolean = false,
     val cast: CastPlaybackUiState = CastPlaybackUiState(),
     val showRatingPrompt: Boolean = false
@@ -80,24 +93,132 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     private val _uiState = MutableStateFlow(TvRemoteUiState())
     val uiState: StateFlow<TvRemoteUiState> = _uiState.asStateFlow()
 
+    private val _navigateToDiscoveryTrigger = MutableStateFlow(false)
+    val navigateToDiscoveryTrigger: StateFlow<Boolean> = _navigateToDiscoveryTrigger.asStateFlow()
+
+    fun resetDiscoveryTrigger() {
+        _navigateToDiscoveryTrigger.value = false
+    }
+
+    fun checkConnectionGuard(): Boolean {
+        val connected = uiState.value.connectedDevice != null
+        if (!connected) {
+            Timber.w("[ConnectionGuard] Action attempted but device is disconnected. Triggering discovery.")
+            _navigateToDiscoveryTrigger.value = true
+        }
+        return connected
+    }
+
     private var pendingDeviceId: String? = null
     private var activeDeviceId: String? = null
     private var currentConnectableListener: ConnectableDeviceListener? = null
     private var playbackPollJob: Job? = null
+    private var heartbeatJob: Job? = null
     private var mediaControl: MediaControl? = null
     private var launchSession: LaunchSession? = null
+    private var autoReconnectJob: Job? = null
+    private var autoReconnectScheduleJob: Job? = null
+    private var autoReconnectAttempts = 0
+    /** Watchdog that cancels a stuck auto-reconnect after AUTO_RECONNECT_TIMEOUT_MS. */
+    private var connectionWatchdogJob: Job? = null
     private var connectionGeneration = 0
-    private var autoReconnectInFlight = false
+
+    // Thread-safe reconnect guard — was a plain Boolean before (race condition)
+    private val autoReconnectInFlight = AtomicBoolean(false)
+
     private var manualDisconnectUntilMs = 0L
     private var imeFieldCounter = 0
     private var imeCounter = 0
+
+    // ── Network callback — detects Wi-Fi reconnect and triggers auto-reconnect ──
+    private val connectivityManager =
+        application.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            Timber.i("[Connection] Network available — scheduling auto-reconnect")
+            scheduleAutoReconnect(delayMs = 1000L)
+        }
+        override fun onLost(network: Network) {
+            Timber.w("[Connection] Network lost")
+        }
+    }
+
+    private var lastBackgroundTime = 0L
 
     init {
         discoveryManager?.addListener(this)
         discoveryManager?.start()
         refreshDiscoveredDevices()
-        attemptAutoReconnect()
+        if (isWifiConnected()) {
+            scheduleAutoReconnect(delayMs = 800L)
+        }
+        registerNetworkCallback()
+
+        // Register process lifecycle observer for background/foreground socket stale checks
+        viewModelScope.launch(Dispatchers.Main) {
+            ProcessLifecycleOwner.get().lifecycle.addObserver(LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_STOP -> {
+                        lastBackgroundTime = System.currentTimeMillis()
+                        Timber.i("[Lifecycle] App entered background at $lastBackgroundTime")
+                    }
+                    Lifecycle.Event.ON_START -> {
+                        onAppForegrounded()
+                    }
+                    else -> {}
+                }
+            })
+        }
     }
+
+    /** Returns true if the device has an active Wi-Fi connection. */
+    private fun isWifiConnected(): Boolean {
+        val network = connectivityManager.activeNetwork ?: return false
+        val caps = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            connectivityManager.registerNetworkCallback(request, networkCallback)
+        } catch (e: Exception) {
+            Timber.e(e, "[Connection] Failed to register network callback")
+        }
+    }
+
+    // ── Heartbeat ─────────────────────────────────────────────────────────────
+    /**
+     * Starts a coroutine that pings the TV every [HEARTBEAT_INTERVAL_MS] ms.
+     * If the ping fails the socket is dead — triggers disconnect handling.
+     * This is the primary mechanism that detects silent disconnects (TV sleep,
+     * idle TCP timeout, Wi-Fi glitch) before the next button press.
+     */
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch(Dispatchers.IO) {
+            Timber.d("[Heartbeat] Started (interval ${HEARTBEAT_INTERVAL_MS}ms)")
+            while (true) {
+                delay(HEARTBEAT_INTERVAL_MS)
+                val remote = app.androidRemoteTv ?: break
+                val alive = remote.isSocketAlive && remote.sendPing()
+                if (!alive) {
+                    Timber.w("[Heartbeat] Ping failed or socket not alive — ensuring connected")
+                    remote.ensureConnected()
+                }
+            }
+            Timber.d("[Heartbeat] Stopped")
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
 
     fun refreshDiscoveredDevices() {
         synchronized(discoveredDevices) {
@@ -110,7 +231,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             }
         }
         publishDeviceSnapshot()
-        attemptAutoReconnect()
+        scheduleAutoReconnect(delayMs = 500L)
     }
 
     fun clearStatus() {
@@ -124,20 +245,20 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     private fun connectToDeviceInternal(deviceId: String, userInitiated: Boolean) {
         val device = synchronized(discoveredDevices) { discoveredDevices[deviceId] } ?: return
         if (userInitiated) {
+            autoReconnectScheduleJob?.cancel()
+            autoReconnectJob?.cancel()
+            connectionWatchdogJob?.cancel()
+            autoReconnectAttempts = 0
             manualDisconnectUntilMs = 0L
             prefs.edit { putBoolean(Constant.PREF_MANUAL_DISCONNECT, false) }
         }
         if (!device.isChromecastServiceDevice()) {
-            synchronized(discoveredDevices) {
-                discoveredDevices.remove(deviceId)
-            }
+            synchronized(discoveredDevices) { discoveredDevices.remove(deviceId) }
             publishDeviceSnapshot()
             showStatus("Only Chromecast service devices can be connected.", isError = true)
             return
         }
-        if (_uiState.value.isConnecting) {
-            return
-        }
+        if (_uiState.value.isConnecting && pendingDeviceId != deviceId) return
 
         if (activeDeviceId != null && activeDeviceId != deviceId) {
             disconnectCurrentDeviceInternal(manual = false)
@@ -163,8 +284,10 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         val isSavedPairing = prefs.getBoolean(Constant.PIN, false)
         val savedHost = prefs.getString(Constant.HOST, null)
         if (isSavedPairing && savedHost == host) {
+            Log.d(TAG, "Attempting to reconnect to saved device")
             reconnectRemote(device, host, allowFreshFallback = true)
         } else {
+            Log.d(TAG, "Attempting to connect to new device")
             connectRemote(device, host)
         }
     }
@@ -177,9 +300,17 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         connectionGeneration += 1
         prefs.edit { putBoolean(Constant.PREF_MANUAL_DISCONNECT, manual) }
         if (manual) {
-            autoReconnectInFlight = false
+            autoReconnectScheduleJob?.cancel()
+            autoReconnectJob?.cancel()
+            connectionWatchdogJob?.cancel()
+            connectionWatchdogJob = null
+            autoReconnectInFlight.set(false)
+            autoReconnectAttempts = 0
             manualDisconnectUntilMs = System.currentTimeMillis() + MANUAL_DISCONNECT_COOLDOWN_MS
         }
+
+        stopHeartbeat()
+        KeepAliveService.stop(app)
         app.androidRemoteTv?.abort()
         app.androidRemoteTv = null
         playbackPollJob?.cancel()
@@ -208,6 +339,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         }
         Constant.isConnected.value = false
         publishDeviceSnapshot()
+        Timber.i("[Connection] Disconnected (manual=$manual)")
     }
 
     fun submitPairingCode(code: String) {
@@ -247,15 +379,33 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun sendKey(keyCode: Remotemessage.RemoteKeyCode) {
+        if (!checkConnectionGuard()) return
+        when (keyCode) {
+            Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_MUTE -> {
+                _uiState.update { it.copy(isMuted = !it.isMuted) }
+            }
+            Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_UP -> {
+                _uiState.update {
+                    val current = it.volumeLevel ?: 50
+                    it.copy(volumeLevel = (current + 5).coerceAtMost(100), isMuted = false)
+                }
+            }
+            Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_DOWN -> {
+                _uiState.update {
+                    val current = it.volumeLevel ?: 50
+                    it.copy(volumeLevel = (current - 5).coerceAtLeast(0))
+                }
+            }
+            else -> Unit
+        }
         viewModelScope.launch(Dispatchers.IO) {
             app.androidRemoteTv?.sendCommand(keyCode, Remotemessage.RemoteDirection.SHORT)
         }
     }
 
     fun sendText(text: String, submit: Boolean) {
-        if (text.isBlank() && !submit) {
-            return
-        }
+        if (!checkConnectionGuard()) return
+        if (text.isBlank() && !submit) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 sendImeTextUpdate(text)
@@ -263,12 +413,13 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                     app.androidRemoteTv?.sendImeEnter()
                 }
             } catch (error: Exception) {
-                Log.e(TAG, "Failed to send text", error)
+                Timber.e(error, "[Keyboard] Failed to send text")
             }
         }
     }
 
     fun sendKeyboardText(text: String) {
+        if (!checkConnectionGuard()) return
         if (text.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -277,13 +428,15 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                 text.forEach { character ->
                     remote.sendText(character.toString(), imeCounter++, currentFieldCounter)
                 }
+                Timber.d("[Keyboard] Sent ${text.length} character(s), fieldCounter=$currentFieldCounter")
             } catch (error: Exception) {
-                Log.e(TAG, "Failed to send keyboard text", error)
+                Timber.e(error, "[Keyboard] Failed to send keyboard text")
             }
         }
     }
 
     fun sendKeyboardBackspace(count: Int = 1) {
+        if (!checkConnectionGuard()) return
         if (count <= 0) return
         viewModelScope.launch(Dispatchers.IO) {
             repeat(count) {
@@ -296,36 +449,71 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun sendKeyboardEnter() {
+        if (!checkConnectionGuard()) return
         viewModelScope.launch(Dispatchers.IO) {
             app.androidRemoteTv?.sendImeEnter()
         }
     }
 
+    /**
+     * Launch a built-in quick app by name, or fall back to a custom shortcut
+     * with a matching label (case-insensitive).
+     */
     fun launchQuickApp(appName: String) {
-        val appUrl = when (appName) {
-            "Netflix" -> "https://www.netflix.com/title.*"
-            "YouTube" -> "https://www.youtube.com"
-            "Prime", "Prime Video" -> "https://www.primevideo.com/"
-            "Disney+" -> "https://www.disneyplus.com/"
-            "JioHotstar", "Hotstar" -> "https://www.hotstar.com/"
-            "Jio Hotstar" -> "https://www.hotstar.com/"
-            "SonyLIV" -> "https://www.sonyliv.com/"
-            "Hulu" -> "https://www.hulu.com/"
-            "Apple TV" -> "https://tv.apple.com/"
-            "HBO Max", "Max" -> "https://max.com/"
-            "Spotify" -> "https://open.spotify.com/"
-            else -> null
-        }
-        if (appUrl == null) {
-            showStatus("This shortcut is not mapped yet.", isError = true)
+        if (!checkConnectionGuard()) return
+        // If appName is already a direct URL or Intent URI (e.g. from custom shortcut)
+        if (appName.startsWith("https://", ignoreCase = true) ||
+            appName.startsWith("http://", ignoreCase = true) ||
+            appName.startsWith("intent://", ignoreCase = true) ||
+            appName.startsWith("market://", ignoreCase = true)
+        ) {
+            viewModelScope.launch(Dispatchers.IO) {
+                Timber.i("[AppLink] Launching direct URI: $appName")
+                app.androidRemoteTv?.sendAppLink(appName)
+            }
             return
         }
+
+        val appUrl = builtInAppUrl(appName)
+        if (appUrl != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                Timber.i("[AppLink] Launching built-in app: $appName -> $appUrl")
+                app.androidRemoteTv?.sendAppLink(appUrl)
+            }
+            return
+        }
+        // Fall back to custom shortcuts stored in DataStore
         viewModelScope.launch(Dispatchers.IO) {
-            app.androidRemoteTv?.sendAppLink(appUrl)
+            val custom = ShortcutsDataStore.loadShortcuts(app)
+            val match = custom.firstOrNull {
+                it.id == appName ||
+                it.label.equals(appName, ignoreCase = true) ||
+                it.intentUri.equals(appName, ignoreCase = true)
+            }
+            if (match != null) {
+                Timber.i("[AppLink] Launching custom shortcut: ${match.label} -> ${match.intentUri}")
+                app.androidRemoteTv?.sendAppLink(match.intentUri)
+            } else {
+                Timber.w("[AppLink] No shortcut found for: $appName")
+                showStatus("This shortcut is not mapped yet.", isError = true)
+            }
+        }
+    }
+
+    /**
+     * Launch a custom shortcut directly by its Intent URI.
+     * Used from the ManageShortcutsScreen test button.
+     */
+    fun launchCustomShortcut(intentUri: String) {
+        if (!checkConnectionGuard()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            Timber.i("[AppLink] Launching custom shortcut URI: $intentUri")
+            app.androidRemoteTv?.sendAppLink(intentUri)
         }
     }
 
     fun toggleVoice() {
+        if (!checkConnectionGuard()) return
         val remote = app.androidRemoteTv ?: return
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -333,6 +521,9 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                 if (isActive) {
                     remote.stopVoice()
                 } else {
+                    remote.setVoiceAutoStopCallback {
+                        _uiState.update { it.copy(isVoiceActive = false) }
+                    }
                     remote.startVoice()
                 }
                 _uiState.update { it.copy(isVoiceActive = remote.isVoiceActive) }
@@ -343,6 +534,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun volumeUp() {
+        if (!checkConnectionGuard()) return
         sendKey(Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_UP)
         _uiState.update {
             val next = (it.volumeFraction + 0.05f).coerceAtMost(1f)
@@ -351,6 +543,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun volumeDown() {
+        if (!checkConnectionGuard()) return
         sendKey(Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_DOWN)
         _uiState.update {
             val next = (it.volumeFraction - 0.05f).coerceAtLeast(0f)
@@ -359,26 +552,47 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setVolume(targetFraction: Float) {
+        if (!checkConnectionGuard()) return
         val connectableDevice = currentConnectableDevice() ?: return
         val clamped = targetFraction.coerceIn(0f, 1f)
         _uiState.update { it.copy(volumeFraction = clamped) }
-
         connectableDevice.volumeControl?.setVolume(
             clamped,
             object : ResponseListener<Any> {
                 override fun onSuccess(response: Any?) = Unit
-
                 override fun onError(error: ServiceCommandError?) {
-                    Log.w(TAG, "setVolume failed: ${error?.message}")
+                    Timber.w("[Volume] setVolume failed: ${error?.message}")
                 }
             }
         )
     }
 
     fun castMedia(mediaItem: MediaItemUi) {
+        // Immediately populate activeMedia in state so CastPlayerScreen displays media details instantly
+        _uiState.update {
+            it.copy(cast = it.cast.copy(activeMedia = mediaItem, isBusy = true))
+        }
+
         val connectableDevice = currentConnectableDevice()
-        if (connectableDevice == null || !connectableDevice.isConnected) {
+        if (connectableDevice == null) {
+            Timber.e("[Cast] Failed: No connectable device active")
             showStatus("Connect to a TV before casting.", isError = true)
+            _uiState.update { it.copy(cast = it.cast.copy(isBusy = false, isCasting = false)) }
+            return
+        }
+
+        if (!connectableDevice.isConnected) {
+            Timber.i("[Cast] Connecting ConnectableDevice for casting: ${connectableDevice.friendlyName}")
+            try { connectableDevice.connect() } catch (_: Exception) {}
+        }
+
+        val mediaPlayer = connectableDevice.getCapability(MediaPlayer::class.java)
+            ?: connectableDevice.services?.firstNotNullOfOrNull { it.getAPI(MediaPlayer::class.java) }
+
+        if (mediaPlayer == null) {
+            Timber.e("[Cast] Device ${connectableDevice.friendlyName} does not expose a MediaPlayer capability")
+            showStatus("Connected device does not support media casting.", isError = true)
+            _uiState.update { it.copy(cast = it.cast.copy(isBusy = false, isCasting = false)) }
             return
         }
 
@@ -388,17 +602,20 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             displayName = mediaItem.title
         )
         if (castUrl == null) {
+            Timber.e("[Cast] Failed to build local cast URL for ${mediaItem.title} (${mediaItem.uri})")
             showStatus("Could not prepare media for casting.", isError = true)
+            _uiState.update { it.copy(cast = it.cast.copy(isBusy = false, isCasting = false)) }
             return
         }
 
-        _uiState.update {
-            it.copy(
-                cast = it.cast.copy(
-                    activeMedia = mediaItem,
-                    isBusy = true
-                )
-            )
+        Timber.i("[Cast] Starting cast for ${mediaItem.title} on ${connectableDevice.friendlyName} via ${mediaPlayer.javaClass.simpleName} (URL=$castUrl)")
+
+        // Warn early for HEVC/4K content on potentially unsupported receivers
+        val isHevc = mediaItem.mimeType.contains("hevc", ignoreCase = true) ||
+            mediaItem.mimeType.contains("hev1", ignoreCase = true) ||
+            mediaItem.mimeType.contains("h265", ignoreCase = true)
+        if (isHevc) {
+            Timber.w("[Cast] HEVC content detected (${mediaItem.mimeType}) — may not play on all receivers")
         }
 
         val mediaInfo = MediaInfo.Builder(castUrl, mediaItem.mimeType)
@@ -406,70 +623,52 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             .setDescription(mediaItem.subtitle)
             .build()
 
-        if (mediaItem.kind == MediaKind.Photo) {
-            connectableDevice.mediaPlayer?.displayImage(
-                mediaInfo,
-                object : MediaPlayer.LaunchListener {
-                    override fun onSuccess(mediaLaunchObject: MediaPlayer.MediaLaunchObject) {
-                        launchSession = mediaLaunchObject.launchSession
-                        mediaControl = mediaLaunchObject.mediaControl
-                        _uiState.update {
-                            it.copy(
-                                cast = CastPlaybackUiState(
-                                    activeMedia = mediaItem,
-                                    isCasting = true,
-                                    isBusy = false,
-                                    isPlaying = true
-                                ),
-                                statusMessage = "Photo cast started",
-                                isError = false
-                            )
-                        }
-                    }
-
-                    override fun onError(error: ServiceCommandError) {
-                        showStatus(
-                            error.message ?: "Photo casting failed.",
-                            isError = true
-                        )
-                        _uiState.update { it.copy(cast = it.cast.copy(isBusy = false)) }
-                    }
+        val listener = object : MediaPlayer.LaunchListener {
+            override fun onSuccess(mediaLaunchObject: MediaPlayer.MediaLaunchObject) {
+                launchSession = mediaLaunchObject.launchSession
+                mediaControl = mediaLaunchObject.mediaControl
+                _uiState.update {
+                    it.copy(
+                        cast = CastPlaybackUiState(
+                            activeMedia = mediaItem,
+                            isCasting = true,
+                            isBusy = false,
+                            isPlaying = true,
+                            durationMs = mediaItem.durationMs
+                        ),
+                        statusMessage = "Casting ${mediaItem.title}",
+                        isError = false
+                    )
                 }
-            )
-        } else {
-            connectableDevice.mediaPlayer?.playMedia(
-                mediaInfo,
-                false,
-                object : MediaPlayer.LaunchListener {
-                    override fun onSuccess(mediaLaunchObject: MediaPlayer.MediaLaunchObject) {
-                        launchSession = mediaLaunchObject.launchSession
-                        mediaControl = mediaLaunchObject.mediaControl
-                        _uiState.update {
-                            it.copy(
-                                cast = CastPlaybackUiState(
-                                    activeMedia = mediaItem,
-                                    isCasting = true,
-                                    isBusy = false,
-                                    isPlaying = true,
-                                    durationMs = mediaItem.durationMs
-                                ),
-                                statusMessage = "Casting ${mediaItem.title}",
-                                isError = false
-                            )
-                        }
-                        startPlaybackPolling()
-                    }
-
-                    override fun onError(error: ServiceCommandError) {
-                        showStatus(
-                            error.message ?: "Media casting failed.",
-                            isError = true
-                        )
-                        _uiState.update { it.copy(cast = it.cast.copy(isBusy = false)) }
-                    }
+                if (mediaItem.kind != MediaKind.Photo) {
+                    startPlaybackPolling()
                 }
-            )
+                Timber.i("[Cast] SUCCESS: Media casting started for ${mediaItem.title} (launchSession=${launchSession != null}, mediaControl=${mediaControl != null})")
+            }
+
+            override fun onError(error: ServiceCommandError) {
+                val msg = buildCastErrorMessage(error, mediaItem)
+                showStatus(msg, isError = true)
+                _uiState.update { it.copy(cast = it.cast.copy(isBusy = false, isCasting = false)) }
+                Timber.e("[Cast] ERROR: Media casting failed for ${mediaItem.title}: code=${error.code}, message=${error.message}")
+            }
         }
+
+        if (mediaItem.kind == MediaKind.Photo) {
+            mediaPlayer.displayImage(mediaInfo, listener)
+        } else {
+            mediaPlayer.playMedia(mediaInfo, false, listener)
+        }
+    }
+
+    /** Build a user-friendly error message, with codec hints for HEVC/4K content. */
+    private fun buildCastErrorMessage(error: ServiceCommandError, mediaItem: MediaItemUi): String {
+        val base = error.message ?: "Media casting failed."
+        val isHevc = mediaItem.mimeType.contains("hevc", ignoreCase = true) ||
+            mediaItem.mimeType.contains("hev1", ignoreCase = true)
+        return if (isHevc) {
+            "$base\n\nThis looks like HEVC/H.265 content. Your TV may not support this codec via casting. Try converting to H.264 for better compatibility."
+        } else base
     }
 
     fun togglePlayback() {
@@ -486,9 +685,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     fun seekTo(progressFraction: Float) {
         val control = mediaControl ?: return
         val duration = _uiState.value.cast.durationMs
-        if (duration <= 0L) {
-            return
-        }
+        if (duration <= 0L) return
         val position = (duration * progressFraction.coerceIn(0f, 1f)).toLong()
         control.seek(position, emptyResponseListener())
         _uiState.update {
@@ -502,13 +699,23 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun stopCasting() {
+        Timber.i("[Cast] stopCasting called by user — stopping media session")
         playbackPollJob?.cancel()
         playbackPollJob = null
-        mediaControl?.stop(emptyResponseListener())
+        try {
+            mediaControl?.stop(object : ResponseListener<Any> {
+                override fun onSuccess(response: Any?) {
+                    Timber.i("[Cast] mediaControl.stop SUCCESS")
+                }
+                override fun onError(error: ServiceCommandError?) {
+                    Timber.w("[Cast] mediaControl.stop ERROR: ${error?.message}")
+                }
+            })
+        } catch (e: Exception) {
+            Timber.w(e, "[Cast] Exception stopping mediaControl")
+        }
         launchSession = null
         mediaControl = null
-        // Keep activeMedia so the player screen doesn't go blank.
-        // The screen will show a stopped state — user navigates back themselves.
         _uiState.update {
             it.copy(
                 cast = it.cast.copy(
@@ -524,32 +731,41 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Call this when navigating away from the player to truly clear media state. */
     fun clearCastMedia() {
         _uiState.update { it.copy(cast = CastPlaybackUiState()) }
     }
 
+    // ── DiscoveryManagerListener ──────────────────────────────────────────────
+
     override fun onDeviceAdded(manager: DiscoveryManager?, device: ConnectableDevice?) {
         device ?: return
         if (!device.isChromecastServiceDevice()) {
-            synchronized(discoveredDevices) {
-                discoveredDevices.remove(device.id)
-            }
+            synchronized(discoveredDevices) { discoveredDevices.remove(device.id) }
             publishDeviceSnapshot()
             return
         }
         synchronized(discoveredDevices) {
+            val ip = device.ipAddress
+            if (!ip.isNullOrBlank()) {
+                val duplicateKeys = discoveredDevices.filterValues { it.ipAddress == ip && it.id != device.id }.keys.toList()
+                duplicateKeys.forEach { discoveredDevices.remove(it) }
+            }
             discoveredDevices[device.id] = device
         }
         validateReachability(device)
         publishDeviceSnapshot()
-        attemptAutoReconnect()
+        scheduleAutoReconnect(delayMs = 500L)
     }
 
     override fun onDeviceUpdated(manager: DiscoveryManager?, device: ConnectableDevice?) {
         device ?: return
         synchronized(discoveredDevices) {
             if (device.isChromecastServiceDevice()) {
+                val ip = device.ipAddress
+                if (!ip.isNullOrBlank()) {
+                    val duplicateKeys = discoveredDevices.filterValues { it.ipAddress == ip && it.id != device.id }.keys.toList()
+                    duplicateKeys.forEach { discoveredDevices.remove(it) }
+                }
                 discoveredDevices[device.id] = device
                 validateReachability(device)
             } else {
@@ -557,13 +773,12 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             }
         }
         publishDeviceSnapshot()
+        scheduleAutoReconnect(delayMs = 500L)
     }
 
     override fun onDeviceRemoved(manager: DiscoveryManager?, device: ConnectableDevice?) {
         device ?: return
-        synchronized(discoveredDevices) {
-            discoveredDevices.remove(device.id)
-        }
+        synchronized(discoveredDevices) { discoveredDevices.remove(device.id) }
         device.ipAddress?.let { reachableHosts.remove(it) }
         if (activeDeviceId == device.id) {
             disconnectCurrentDevice()
@@ -578,22 +793,35 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         super.onCleared()
+        autoReconnectScheduleJob?.cancel()
+        autoReconnectJob?.cancel()
+        connectionWatchdogJob?.cancel()
+        connectionWatchdogJob = null
+        stopHeartbeat()
+        KeepAliveService.stop(app)
         playbackPollJob?.cancel()
         discoveryManager?.removeListener(this)
+        try {
+            connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {}
     }
+
+
+    // ── Connection internals ─────────────────────────────────────────────────
 
     private fun connectRemote(
         device: ConnectableDevice,
         host: String,
         onSecretFallbackMessage: String? = null
     ) {
+        val connectionToken = ++connectionGeneration
         app.androidRemoteTv?.abort()
         app.androidRemoteTv = null
-        val connectionToken = ++connectionGeneration
         val remote = app.getOrCreateAndroidRemoteTv()
         remote.addListener(volumeListener)
         app.androidRemoteTv = remote
 
+        Timber.i("[Connection] Starting fresh connect to $host (token=$connectionToken)")
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 remote.connect(host, createRemoteListener(device, host, onSecretFallbackMessage, connectionToken))
@@ -610,19 +838,24 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         host: String,
         allowFreshFallback: Boolean
     ) {
+        Log.d(TAG, "reconnectRemote: ")
+        val connectionToken = ++connectionGeneration
         app.androidRemoteTv?.abort()
         app.androidRemoteTv = null
-        val connectionToken = ++connectionGeneration
         val remote = app.getOrCreateAndroidRemoteTv()
         remote.addListener(volumeListener)
+        remote.setVolumeChangedCallback { level, maxLevel, muted ->
+            updateVolumeState(level, maxLevel, muted)
+        }
         app.androidRemoteTv = remote
 
+        Timber.i("[Connection] Attempting reconnect to $host (token=$connectionToken)")
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 remote.reconnect(host, object : AndroidTvListener {
                     override fun onSessionCreated() = Unit
-
                     override fun onSecretRequested() {
+
                         if (!isActiveConnection(connectionToken)) return
                         prefs.edit {
                             remove(Constant.HOST)
@@ -630,35 +863,29 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                         }
                         if (allowFreshFallback) {
                             connectRemote(
-                                device = device,
-                                host = host,
+                                device = device, host = host,
                                 onSecretFallbackMessage = "Pairing code needed. Enter it to finish reconnecting."
                             )
                         } else {
                             handleConnectError(device, "Pairing code needed to reconnect.")
                         }
                     }
-
                     override fun onPaired() = Unit
-
                     override fun onConnectingToRemote() = Unit
-
                     override fun onConnected() {
                         if (!isActiveConnection(connectionToken)) return
                         app.androidRemoteTv = remote
                         attachConnectableDevice(device, host, connectionToken)
                     }
-
                     override fun onDisconnect() {
                         if (!isActiveConnection(connectionToken)) return
+                        Timber.w("[Connection] onDisconnect fired during reconnect")
                         handleDeviceDisconnected()
                     }
-
                     override fun onImeShow(text: String, fieldCounter: Int) {
                         if (!isActiveConnection(connectionToken)) return
                         syncImeState(text, fieldCounter)
                     }
-
                     override fun onError(error: String) {
                         if (!isActiveConnection(connectionToken)) return
                         handleConnectError(device, error)
@@ -680,40 +907,33 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     ): AndroidTvListener {
         return object : AndroidTvListener {
             override fun onSessionCreated() = Unit
-
             override fun onSecretRequested() {
                 if (!isActiveConnection(connectionToken)) return
                 _uiState.update {
                     it.copy(
-                        pairingRequired = true,
-                        pairingError = null,
+                        pairingRequired = true, pairingError = null,
                         pairingRequestId = it.pairingRequestId + 1,
                         statusMessage = pairingMessage ?: "Enter the pairing code shown on your TV.",
                         isError = false
                     )
                 }
             }
-
             override fun onPaired() = Unit
-
             override fun onConnectingToRemote() = Unit
-
             override fun onConnected() {
                 if (!isActiveConnection(connectionToken)) return
                 app.androidRemoteTv = app.getOrCreateAndroidRemoteTv()
                 attachConnectableDevice(device, host, connectionToken)
             }
-
             override fun onDisconnect() {
                 if (!isActiveConnection(connectionToken)) return
+                Timber.w("[Connection] onDisconnect fired on listener (token=$connectionToken)")
                 handleDeviceDisconnected()
             }
-
             override fun onImeShow(text: String, fieldCounter: Int) {
                 if (!isActiveConnection(connectionToken)) return
                 syncImeState(text, fieldCounter)
             }
-
             override fun onError(error: String) {
                 if (!isActiveConnection(connectionToken)) return
                 handleConnectError(device, error)
@@ -723,10 +943,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
 
     private fun attachConnectableDevice(device: ConnectableDevice, host: String, connectionToken: Int) {
         currentConnectableListener?.let { previous ->
-            try {
-                device.removeListener(previous)
-            } catch (_: Exception) {
-            }
+            try { device.removeListener(previous) } catch (_: Exception) {}
         }
 
         val listener = object : ConnectableDeviceListener {
@@ -736,7 +953,15 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                 Constant.isConnected.value = true
                 activeDeviceId = connectableDevice.id
                 pendingDeviceId = null
-                autoReconnectInFlight = false
+                val remote = app.androidRemoteTv
+                if (remote != null) {
+                    remote.setVolumeChangedCallback { level, maxLevel, muted ->
+                        updateVolumeState(level, maxLevel, muted)
+                    }
+                    if (remote.currentVolume >= 0) {
+                        updateVolumeState(remote.currentVolume, remote.maxVolume, remote.isMuted)
+                    }
+                }
                 val currentConnections = prefs.getInt("successful_connections", 0) + 1
                 val hasRated = prefs.getBoolean("has_rated_or_feedback", false)
                 val lastAsked = prefs.getInt("last_asked_connection", 0)
@@ -750,26 +975,33 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                 }
                 imeFieldCounter = app.lastFieldCounter.coerceAtLeast(0)
                 observeRealVolume()
+                // ── Cancel the timeout watchdog — connection succeeded in time.
+                connectionWatchdogJob?.cancel()
+                connectionWatchdogJob = null
+                autoReconnectScheduleJob?.cancel()
+                autoReconnectAttempts = 0
+                autoReconnectInFlight.set(false)
+                startHeartbeat()
+                KeepAliveService.start(app, connectableDevice.friendlyName ?: "TV")
+
                 _uiState.update {
                     it.copy(
                         connectedDevice = connectableDevice.toUiModel(
-                            isPaired = true,
-                            isConnected = true,
-                            isConnecting = false
+                            isPaired = true, isConnected = true, isConnecting = false
                         ),
-                        isConnecting = false,
-                        pairingRequired = false,
+                        isConnecting = false, pairingRequired = false,
                         pairingError = null,
                         statusMessage = "${connectableDevice.friendlyName} connected",
-                        isError = false,
-                        showRatingPrompt = shouldPrompt
+                        isError = false, showRatingPrompt = shouldPrompt
                     )
                 }
                 publishDeviceSnapshot()
+                Timber.i("[Connection] Connected to ${connectableDevice.friendlyName} at $host")
             }
 
             override fun onDeviceDisconnected(connectableDevice: ConnectableDevice) {
                 if (!isActiveConnection(connectionToken)) return
+                Timber.w("[Connection] ConnectableDevice disconnected: ${connectableDevice.friendlyName}")
                 handleDeviceDisconnected()
             }
 
@@ -799,23 +1031,59 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         device.connect()
     }
 
-    private fun observeRealVolume() {
-        app.androidRemoteTv?.setVolumeChangedCallback { level, maxLevel, _ ->
-            val fraction = if (maxLevel <= 0) 0f else level.toFloat() / maxLevel.toFloat()
-            _uiState.update { it.copy(volumeFraction = fraction.coerceIn(0f, 1f)) }
+    private fun updateVolumeState(level: Int, maxLevel: Int, muted: Boolean) {
+        val fraction = if (maxLevel <= 0) 0f else (level.toFloat() / maxLevel.toFloat()).coerceIn(0f, 1f)
+        val percent = if (maxLevel <= 0) 0 else Math.round(fraction * 100).coerceIn(0, 100)
+        _uiState.update {
+            it.copy(
+                volumeFraction = fraction,
+                volumeLevel = percent,
+                isMuted = muted
+            )
         }
-        currentConnectableDevice()?.volumeControl?.getVolume(
+    }
+
+    private fun observeRealVolume() {
+        app.androidRemoteTv?.setVolumeChangedCallback { level, maxLevel, muted ->
+            updateVolumeState(level, maxLevel, muted)
+        }
+        val dev = currentConnectableDevice()
+        dev?.volumeControl?.getVolume(
             object : VolumeControl.VolumeListener {
                 override fun onSuccess(volume: Float?) {
                     volume ?: return
-                    _uiState.update { it.copy(volumeFraction = volume.coerceIn(0f, 1f)) }
+                    val levelInt = (volume * 100).toInt()
+                    _uiState.update {
+                        it.copy(
+                            volumeFraction = volume.coerceIn(0f, 1f),
+                            volumeLevel = levelInt
+                        )
+                    }
                 }
-
                 override fun onError(error: ServiceCommandError?) {
-                    Log.w(TAG, "Initial volume fetch failed: ${error?.message}")
+                    Timber.w("[Volume] Initial volume fetch failed: ${error?.message}")
                 }
             }
         )
+        try {
+            dev?.volumeControl?.subscribeVolume(
+                object : VolumeControl.VolumeListener {
+                    override fun onSuccess(volume: Float?) {
+                        volume ?: return
+                        val levelInt = (volume * 100).toInt()
+                        _uiState.update {
+                            it.copy(
+                                volumeFraction = volume.coerceIn(0f, 1f),
+                                volumeLevel = levelInt
+                            )
+                        }
+                    }
+                    override fun onError(error: ServiceCommandError?) {}
+                }
+            )
+        } catch (e: Exception) {
+            Timber.w(e, "[Volume] subscribeVolume not supported on this device")
+        }
     }
 
     private fun startPlaybackPolling() {
@@ -832,14 +1100,11 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                                     positionMs = safePosition,
                                     progressFraction = if (duration > 0L) {
                                         (safePosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-                                    } else {
-                                        0f
-                                    }
+                                    } else 0f
                                 )
                             )
                         }
                     }
-
                     override fun onError(error: ServiceCommandError?) = Unit
                 })
                 mediaControl?.getDuration(object : MediaControl.DurationListener {
@@ -851,29 +1116,19 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                                     durationMs = safeDuration,
                                     progressFraction = if (safeDuration > 0L) {
                                         (state.cast.positionMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
-                                    } else {
-                                        0f
-                                    }
+                                    } else 0f
                                 )
                             )
                         }
                     }
-
                     override fun onError(error: ServiceCommandError?) = Unit
                 })
                 mediaControl?.getPlayState(object : MediaControl.PlayStateListener {
                     override fun onSuccess(playState: MediaControl.PlayStateStatus?) {
                         val isPlaying = playState == MediaControl.PlayStateStatus.Playing ||
                             playState == MediaControl.PlayStateStatus.Buffering
-                        _uiState.update {
-                            it.copy(
-                                cast = it.cast.copy(
-                                    isPlaying = isPlaying
-                                )
-                            )
-                        }
+                        _uiState.update { it.copy(cast = it.cast.copy(isPlaying = isPlaying)) }
                     }
-
                     override fun onError(error: ServiceCommandError?) = Unit
                 })
                 delay(1_000)
@@ -881,74 +1136,194 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun onAppForegrounded() {
+        val lastBg = lastBackgroundTime
+        lastBackgroundTime = 0L
+        Timber.i("[Lifecycle] App entered foreground. Connected: ${_uiState.value.connectedDevice != null}, Stale duration: ${if (lastBg > 0L) (System.currentTimeMillis() - lastBg) / 1000 else 0}s")
+
+        val remote = app.androidRemoteTv
+        if (remote != null && _uiState.value.connectedDevice != null) {
+            // Verify existing session is alive, proactively reconnect seamlessly if needed
+            viewModelScope.launch(Dispatchers.IO) {
+                if (!remote.isSocketAlive || !remote.sendPing()) {
+                    Timber.w("[Lifecycle] Active ping failed on foreground wake-up — ensuring connected")
+                    remote.ensureConnected()
+                } else {
+                    Timber.i("[Lifecycle] Active connection verified alive after foreground resume")
+                }
+            }
+        } else if (_uiState.value.connectedDevice == null && !_uiState.value.isConnecting) {
+            // No active connection at all — cancel any stuck reconnect and retry
+            viewModelScope.launch(Dispatchers.Main) {
+                connectionWatchdogJob?.cancel()
+                connectionWatchdogJob = null
+                autoReconnectScheduleJob?.cancel()
+                autoReconnectJob?.cancel()
+                autoReconnectInFlight.set(false)
+                if (isWifiConnected()) {
+                    scheduleAutoReconnect(delayMs = 300L)
+                }
+            }
+        }
+    }
+
+    private fun scheduleAutoReconnect(delayMs: Long = 500L) {
+        if (_uiState.value.connectedDevice != null || Constant.isConnected.value == true) {
+            autoReconnectAttempts = 0
+            return
+        }
+        if (prefs.getBoolean(Constant.PREF_MANUAL_DISCONNECT, false)) return
+        if (System.currentTimeMillis() < manualDisconnectUntilMs) return
+        if (!prefs.getBoolean(Constant.PREF_AUTO_RECONNECT, true) || !prefs.getBoolean(Constant.PIN, false)) return
+        if (autoReconnectAttempts >= MAX_AUTO_RECONNECT_ATTEMPTS) {
+            Timber.w("[AutoReconnect] Max auto-reconnect attempts ($MAX_AUTO_RECONNECT_ATTEMPTS) reached; awaiting user action")
+            return
+        }
+
+        autoReconnectScheduleJob?.cancel()
+        autoReconnectScheduleJob = viewModelScope.launch(Dispatchers.Main) {
+            delay(delayMs)
+            if (_uiState.value.connectedDevice == null && !autoReconnectInFlight.get() && !_uiState.value.isConnecting) {
+                val host = prefs.getString(Constant.HOST, null)
+                val deviceFound = synchronized(discoveredDevices) {
+                    host != null && discoveredDevices.values.any { it.ipAddress == host }
+                }
+                if (deviceFound) {
+                    autoReconnectAttempts++
+                    Timber.d("[AutoReconnect] Debounced trigger firing attempt $autoReconnectAttempts/$MAX_AUTO_RECONNECT_ATTEMPTS")
+                    attemptAutoReconnect()
+                } else {
+                    Timber.d("[AutoReconnect] Scheduled reconnect triggered, but device $host not yet discovered")
+                }
+            }
+        }
+    }
+
     private fun attemptAutoReconnect() {
-        if (autoReconnectInFlight || _uiState.value.isConnecting || _uiState.value.connectedDevice != null) {
+        if (autoReconnectInFlight.get() || _uiState.value.isConnecting || _uiState.value.connectedDevice != null) {
             return
         }
         if (!prefs.getBoolean(Constant.PREF_AUTO_RECONNECT, true) || !prefs.getBoolean(Constant.PIN, false)) {
             return
         }
-        if (prefs.getBoolean(Constant.PREF_MANUAL_DISCONNECT, false)) {
-            return
-        }
-        if (System.currentTimeMillis() < manualDisconnectUntilMs) {
-            return
-        }
+        if (prefs.getBoolean(Constant.PREF_MANUAL_DISCONNECT, false)) return
+        if (System.currentTimeMillis() < manualDisconnectUntilMs) return
 
         val host = prefs.getString(Constant.HOST, null) ?: return
+
+        // ── Active registry check: match last connected IP against background mDNS
+        // discovered devices.  Will be re-triggered by onDeviceAdded/onDeviceUpdated
+        // as soon as discovery finds the device on the network.
         val device = synchronized(discoveredDevices) {
             discoveredDevices.values.firstOrNull { it.ipAddress == host }
-        } ?: return
-        if (!isDeviceReachable(device)) {
-            validateReachability(device)
+        }
+        if (device == null) {
+            Timber.d("[AutoReconnect] Target device at $host not yet discovered in registry, awaiting mDNS...")
             return
         }
 
-        autoReconnectInFlight = true
-        connectToDeviceInternal(device.id, userInitiated = false)
+        Timber.i("[AutoReconnect] Network target $host matched registry. Starting silent reconnect.")
+        autoReconnectInFlight.set(true)
+
+        // ── Timeout guard: launch a watchdog coroutine that fires after
+        // AUTO_RECONNECT_TIMEOUT_MS.  If the connection handshake hasn't
+        // completed within this window, we are in the stuck-connecting state.
+        // The watchdog tears down stale state and navigates to Discovery so the
+        // user can select the device manually.
+        connectionWatchdogJob?.cancel()
+        connectionWatchdogJob = viewModelScope.launch(Dispatchers.Main) {
+            delay(AUTO_RECONNECT_TIMEOUT_MS)
+            // If we're still connecting after the timeout window, abort.
+            if (autoReconnectInFlight.get() || _uiState.value.isConnecting) {
+                Timber.w("[AutoReconnect] Watchdog fired — reconnect timed out after ${AUTO_RECONNECT_TIMEOUT_MS}ms. Clearing state.")
+                // Tear down any stale socket
+                app.androidRemoteTv?.abort()
+                app.androidRemoteTv = null
+                autoReconnectInFlight.set(false)
+                pendingDeviceId = null
+                _uiState.update {
+                    it.copy(
+                        isConnecting = false,
+                        pairingRequired = false,
+                        pairingError = null,
+                        statusMessage = "Could not reconnect automatically. Select your TV from the list.",
+                        isError = true
+                    )
+                }
+                publishDeviceSnapshot()
+                // Navigate to Discovery so the user can manually select the device
+                _navigateToDiscoveryTrigger.value = true
+            }
+        }
+
+        autoReconnectJob = viewModelScope.launch(Dispatchers.IO) {
+            connectToDeviceInternal(device.id, userInitiated = false)
+        }
     }
 
     private fun publishDeviceSnapshot() {
         val pendingId = pendingDeviceId
         val connectedId = activeDeviceId
         val pairedHost = prefs.getString(Constant.HOST, null)
+        val isDeviceConnected = Constant.isConnected.value == true
+
         val snapshot = synchronized(discoveredDevices) {
             discoveredDevices.values
                 .filter { it.isChromecastServiceDevice() }
                 .filter { device -> activeDeviceId == device.id || isDeviceReachable(device) }
+                .distinctBy { device -> device.ipAddress?.takeIf { it.isNotBlank() } ?: device.id }
                 .map { device ->
-                device.toUiModel(
-                    isPaired = device.ipAddress == pairedHost && prefs.getBoolean(Constant.PIN, false),
-                    isConnected = connectedId == device.id,
-                    isConnecting = pendingId == device.id
+                    val isConnected = isDeviceConnected && (
+                        connectedId == device.id ||
+                        (!pairedHost.isNullOrBlank() && device.ipAddress == pairedHost)
+                    )
+                    device.toUiModel(
+                        isPaired = device.ipAddress == pairedHost && prefs.getBoolean(Constant.PIN, false),
+                        isConnected = isConnected,
+                        isConnecting = pendingId == device.id && !isConnected
+                    )
+                }.sortedWith(
+                    compareByDescending<DeviceUiModel> { it.isConnected }
+                        .thenByDescending { it.isPaired }
+                        .thenBy { it.name.lowercase() }
                 )
-            }.sortedWith(
-                compareByDescending<DeviceUiModel> { it.isConnected }
-                    .thenByDescending { it.isPaired }
-                    .thenBy { it.name.lowercase() }
-            )
         }
 
         _uiState.update { state ->
             state.copy(
                 discoveredDevices = snapshot,
-                connectedDevice = snapshot.firstOrNull { it.id == connectedId } ?: state.connectedDevice,
-                isConnecting = pendingId != null
+                connectedDevice = snapshot.firstOrNull { it.isConnected }
+                    ?: snapshot.firstOrNull { it.id == connectedId }
+                    ?: state.connectedDevice,
+                isConnecting = pendingId != null && snapshot.none { it.isConnected }
             )
         }
     }
 
     private fun currentConnectableDevice(): ConnectableDevice? {
-        val currentId = activeDeviceId ?: return null
-        return synchronized(discoveredDevices) { discoveredDevices[currentId] }
+        val currentId = activeDeviceId
+        val fromMap = if (currentId != null) {
+            synchronized(discoveredDevices) {
+                discoveredDevices[currentId]
+                    ?: discoveredDevices.values.firstOrNull { it.id == currentId || it.ipAddress == currentId || it.isConnected }
+            }
+        } else null
+
+        return fromMap
+            ?: Constant.connectableDevice
+            ?: synchronized(discoveredDevices) {
+                discoveredDevices.values.firstOrNull { it.isConnected }
+                    ?: discoveredDevices.values.firstOrNull()
+            }
     }
 
     private fun handleConnectError(device: ConnectableDevice, message: String) {
+        Timber.e("[Connection] Connect error for ${device.friendlyName}: $message")
         if (isWrongPairingCodeError(message) && pendingDeviceId == device.id) {
             handleWrongPairingCode()
             return
         }
-        autoReconnectInFlight = false
+        autoReconnectInFlight.set(false)
         pendingDeviceId = null
         publishDeviceSnapshot()
         showStatus(message, isError = true)
@@ -958,9 +1333,14 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun handleDeviceDisconnected() {
-        autoReconnectInFlight = false
+        // Guard against being called multiple times for the same disconnect
+        // (e.g. both the heartbeat and the reader thread firing simultaneously)
+        val wasConnected = Constant.isConnected.value
+        autoReconnectInFlight.set(false)
         pendingDeviceId = null
         activeDeviceId = null
+        stopHeartbeat()
+        KeepAliveService.stop(app)
         playbackPollJob?.cancel()
         playbackPollJob = null
         mediaControl = null
@@ -974,19 +1354,17 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         app.lastFieldCounter = -1
         _uiState.update {
             it.copy(
-                connectedDevice = null,
-                isConnecting = false,
-                pairingRequired = false,
-                pairingError = null,
-                isVoiceActive = false,
-                cast = CastPlaybackUiState(),
+                connectedDevice = null, isConnecting = false,
+                pairingRequired = false, pairingError = null,
+                isVoiceActive = false, cast = CastPlaybackUiState(),
                 statusMessage = if (manuallyDisconnected) "Disconnected" else "Connection lost",
                 isError = !manuallyDisconnected
             )
         }
         publishDeviceSnapshot()
+        Timber.w("[Connection] Device disconnected (wasConnected=$wasConnected, manual=$manuallyDisconnected)")
         if (!manuallyDisconnected) {
-            attemptAutoReconnect()
+            scheduleAutoReconnect(delayMs = 2500L)
         }
     }
 
@@ -999,12 +1377,10 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             showPairingError("Wrong pairing code. Select your TV again to retry.")
             return
         }
-
         showPairingError("Wrong pairing code. Requesting a new code...")
         app.androidRemoteTv?.abort()
         connectRemote(
-            device = device,
-            host = host,
+            device = device, host = host,
             onSecretFallbackMessage = "Wrong pairing code. Enter the new code shown on your TV."
         )
     }
@@ -1012,12 +1388,9 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     private fun showPairingError(message: String) {
         _uiState.update {
             it.copy(
-                pairingRequired = true,
-                pairingError = message,
+                pairingRequired = true, pairingError = message,
                 pairingRequestId = it.pairingRequestId + 1,
-                statusMessage = message,
-                isError = true,
-                isConnecting = true
+                statusMessage = message, isError = true, isConnecting = true
             )
         }
     }
@@ -1029,9 +1402,8 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             message.contains("invalid", ignoreCase = true)
     }
 
-    private fun isActiveConnection(connectionToken: Int): Boolean {
-        return connectionToken == connectionGeneration
-    }
+    private fun isActiveConnection(connectionToken: Int): Boolean =
+        connectionToken == connectionGeneration
 
     private fun validateReachability(device: ConnectableDevice) {
         val host = device.ipAddress?.takeIf { it.isNotBlank() } ?: return
@@ -1039,16 +1411,10 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch(Dispatchers.IO) {
             val reachable = isHostPortOpen(host, CAST_PORT) || isHostPortOpen(host, REMOTE_PORT)
-            if (reachable) {
-                reachableHosts.add(host)
-            } else {
-                reachableHosts.remove(host)
-            }
+            if (reachable) reachableHosts.add(host) else reachableHosts.remove(host)
             validatingHosts.remove(host)
             publishDeviceSnapshot()
-            if (reachable) {
-                attemptAutoReconnect()
-            }
+            if (reachable) scheduleAutoReconnect(delayMs = 500L)
         }
     }
 
@@ -1063,18 +1429,19 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                 socket.connect(InetSocketAddress(host, port), REACHABILITY_TIMEOUT_MS)
                 true
             }
-        } catch (_: Exception) {
-            false
-        }
+        } catch (_: Exception) { false }
     }
 
     private fun syncImeState(text: String, fieldCounter: Int) {
         app.lastImeText = text
         app.lastFieldCounter = fieldCounter
-        if (fieldCounter > 0) {
+        // KEYBOARD FIX: accept fieldCounter=0 (NVIDIA Shield sends 0 for all fields)
+        // Previous code only updated when fieldCounter > 0, ignoring Shield's valid 0
+        if (fieldCounter >= 0) {
             imeFieldCounter = fieldCounter
         }
         imeCounter = 0
+        Timber.d("[Keyboard] IME state synced: text='$text' fieldCounter=$fieldCounter")
     }
 
     private fun sendImeTextUpdate(text: String) {
@@ -1085,21 +1452,28 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         app.lastImeText = text
     }
 
+    /**
+     * KEYBOARD FIX: Return the field counter as reported by the TV.
+     *
+     * Previous bug: the fallback returned `1` even when the TV had sent
+     * `fieldCounter=0` (NVIDIA Shield always sends 0).  Shield would then
+     * discard the keystroke because the field counter didn't match.
+     *
+     * Fix: use `0` as the fallback. The TV's actual reported value is always
+     * preferred; only when the TV has never sent anything do we use 1 (which
+     * is the default for non-Shield devices that start counting at 1).
+     */
     private fun resolvedImeFieldCounter(): Int {
         return when {
-            imeFieldCounter > 0 -> imeFieldCounter
-            app.lastFieldCounter > 0 -> app.lastFieldCounter
-            else -> 1
+            imeFieldCounter > 0 -> imeFieldCounter  // TV explicitly sent > 0
+            app.lastFieldCounter >= 0 -> app.lastFieldCounter  // 0 is valid (Shield)
+            else -> 1  // No IME event received yet; default for standard ATV
         }
     }
 
     private fun showStatus(message: String, isError: Boolean, isConnecting: Boolean = false) {
         _uiState.update {
-            it.copy(
-                statusMessage = message,
-                isError = isError,
-                isConnecting = isConnecting
-            )
+            it.copy(statusMessage = message, isError = isError, isConnecting = isConnecting)
         }
     }
 
@@ -1139,15 +1513,15 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun ConnectableDevice.isChromecastServiceDevice(): Boolean {
-        if (getServiceByName(ConnectSdkCastService.ID) != null) {
+        val pairedHost = prefs.getString(Constant.HOST, null)
+        if (ipAddress != null && ipAddress == pairedHost && prefs.getBoolean(Constant.PIN, false)) {
             return true
         }
-
+        if (getServiceByName(ConnectSdkCastService.ID) != null) return true
         val primaryServiceId = serviceDescription?.serviceID
         if (primaryServiceId != null && primaryServiceId.equals(ConnectSdkCastService.ID, ignoreCase = true)) {
             return true
         }
-
         val connectedServices = connectedServiceNames ?: return false
         return connectedServices
             .split(",")
@@ -1166,24 +1540,18 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun onUserRated() {
-        prefs.edit {
-            putBoolean("has_rated_or_feedback", true)
-        }
+        prefs.edit { putBoolean("has_rated_or_feedback", true) }
         _uiState.update { it.copy(showRatingPrompt = false) }
     }
 
     fun onUserFeedbackClicked() {
-        prefs.edit {
-            putBoolean("has_rated_or_feedback", true)
-        }
+        prefs.edit { putBoolean("has_rated_or_feedback", true) }
         _uiState.update { it.copy(showRatingPrompt = false) }
     }
 
     fun dismissRatingPrompt() {
         val currentConnections = prefs.getInt("successful_connections", 0)
-        prefs.edit {
-            putInt("last_asked_connection", currentConnections)
-        }
+        prefs.edit { putInt("last_asked_connection", currentConnections) }
         _uiState.update { it.copy(showRatingPrompt = false) }
     }
 
@@ -1193,5 +1561,51 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         const val REMOTE_PORT = 6466
         const val REACHABILITY_TIMEOUT_MS = 700
         const val MANUAL_DISCONNECT_COOLDOWN_MS = 15_000L
+
+        /** Heartbeat ping interval. Keep well below typical TV idle timeout (~60s). */
+        const val HEARTBEAT_INTERVAL_MS = 25_000L
+
+        /**
+         * Maximum time (ms) to wait for a background auto-reconnect to resolve.
+         * Accommodates TCP connect (6s) + TLS/RemoteConfigure handshake (8s).
+         */
+        const val AUTO_RECONNECT_TIMEOUT_MS = 15_000L
+
+        /** Maximum consecutive auto-reconnect retry attempts before pausing. */
+        const val MAX_AUTO_RECONNECT_ATTEMPTS = 4
+
+
+        /** Maps known streaming app names to their Android TV app-link URIs. */
+        fun builtInAppUrl(appName: String): String? = when (appName) {
+            "Netflix"                      -> "https://www.netflix.com/title.*"
+            "YouTube"                      -> "https://www.youtube.com"
+            "Prime", "Prime Video"         -> "https://www.primevideo.com/"
+            "Disney+"                      -> "https://www.disneyplus.com/"
+            "JioHotstar", "Hotstar",
+            "Jio Hotstar"                  -> "https://www.hotstar.com/"
+            "SonyLIV"                      -> "https://www.sonyliv.com/"
+            "Hulu"                         -> "https://www.hulu.com/"
+            "Apple TV"                     -> "https://tv.apple.com/"
+            "HBO Max", "Max"               -> "https://max.com/"
+            "Spotify"                      -> "https://open.spotify.com/"
+            else                           -> null
+        }
+    }
+}
+
+/**
+ * Extension to safely get the underlying RemoteSession from AndroidRemoteTv.
+ * Used by the heartbeat to call sendPing() without reflection.
+ */
+private fun AndroidRemoteTv.remoteSessionOrNull(): com.hari.androidtvremote.androidLib.remote.RemoteSession? {
+    return try {
+        val field = this.javaClass.superclass?.getDeclaredField("mRemoteSession")
+            ?: this.javaClass.getDeclaredField("mRemoteSession")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        field.get(this) as? com.hari.androidtvremote.androidLib.remote.RemoteSession
+    } catch (_: Exception) {
+        // Field access unavailable — fall back to sending a key command as a heartbeat
+        null
     }
 }

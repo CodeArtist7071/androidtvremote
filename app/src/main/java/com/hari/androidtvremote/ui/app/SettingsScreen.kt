@@ -39,6 +39,7 @@ fun SettingsScreenPreview() {
         onOpenRemoteControls = {},
         onOpenAppearance = {},
         onOpenTipsSupport = {},
+        onOpenDonation = {},
         onAutoReconnectChange = {}
     )
 }
@@ -51,6 +52,7 @@ fun SettingsScreen(
     onOpenRemoteControls: () -> Unit,
     onOpenAppearance: () -> Unit,
     onOpenTipsSupport: () -> Unit,
+    onOpenDonation: () -> Unit,
     onAutoReconnectChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -112,6 +114,19 @@ fun SettingsScreen(
                         desc = "About, sponsor, and project support details",
                         icon = Icons.Outlined.TipsAndUpdates,
                         onClick = onOpenTipsSupport
+                    )
+                }
+
+                item {
+                    SettingSubtitle(text = "Support Project")
+                }
+                item {
+                    SettingGroupItem(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        title = "Donation",
+                        desc = "Support open source development, keep it ad-free",
+                        icon = Icons.Filled.Star,
+                        onClick = onOpenDonation
                     )
                 }
 

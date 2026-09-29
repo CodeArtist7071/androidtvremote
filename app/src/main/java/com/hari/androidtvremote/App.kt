@@ -68,8 +68,6 @@ class App : Application() {
     }
 
     private fun ensureLocalMediaServer(): String? {
-        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        if (!wifiManager.isWifiEnabled) return null
         val ip = getIPAddress(true) ?: return null
 
         if (webServer != null && webServerIp == ip) return webServerIp

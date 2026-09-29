@@ -22,6 +22,9 @@ import com.hari.androidtvremote.preference.LocalThemeIndex
 import com.hari.androidtvremote.preference.DarkThemePreference
 import com.hari.androidtvremote.preference.darkThemeFlow
 import com.hari.androidtvremote.preference.themeIndexFlow
+import com.hari.androidtvremote.preference.oledDarkThemeFlow
+import com.hari.androidtvremote.preference.LocalAmoledDarkTheme
+import com.hari.androidtvremote.preference.AmoledDarkTheme
 import com.hari.androidtvremote.ui.theme.AndroidTVRemoteTheme
 import com.hari.androidtvremote.utils.Constant
 
@@ -51,11 +54,14 @@ class MainActivity : ComponentActivity() {
                 .collectAsStateWithLifecycle(initialValue = DarkThemePreference.UseDeviceTheme.value)
             val themeIndex by context.themeIndexFlow()
                 .collectAsStateWithLifecycle(initialValue = 0)
+            val oledDarkThemeEnabled by context.oledDarkThemeFlow()
+                .collectAsStateWithLifecycle(initialValue = false)
 
             val darkTheme = DarkThemePreference.fromInt(darkThemeInt)
             CompositionLocalProvider(
                 LocalDarkTheme provides darkTheme,
                 LocalThemeIndex provides themeIndex,
+                LocalAmoledDarkTheme provides AmoledDarkTheme(oledDarkThemeEnabled)
             ) {
                 AndroidTVRemoteTheme {
                     AppNavGraph(
@@ -71,16 +77,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        val prefs = getSharedPreferences(Constant.PREFS_NAME, Context.MODE_PRIVATE)
-        val autoReconnect = prefs.getBoolean(Constant.PREF_AUTO_RECONNECT, true)
-        val lastHost = prefs.getString(Constant.HOST, null)
-        val isPaired = prefs.getBoolean(Constant.PIN, false)
-
-        if (autoReconnect && !lastHost.isNullOrBlank() && isPaired) {
-            if (Constant.isConnected.value != true) {
-                // SearchViewModel will handle reconnection when launched
-            }
-        }
     }
 
     override fun onStop() {

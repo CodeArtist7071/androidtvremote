@@ -61,6 +61,8 @@ import com.hari.androidtvremote.preference.DarkThemePreference
 import com.hari.androidtvremote.preference.LocalDarkTheme
 import com.hari.androidtvremote.preference.LocalThemeIndex
 import com.hari.androidtvremote.preference.appearanceDataStore
+import com.hari.androidtvremote.preference.oledDarkThemeFlow
+import com.hari.androidtvremote.preference.putOLEDDarkTheme
 import com.hari.androidtvremote.ui.theme.palette.TonalPalettes
 import com.hari.androidtvremote.ui.theme.palette.dynamic.extractTonalPalettesFromUserWallpaper
 import kotlinx.coroutines.flow.map
@@ -169,6 +171,30 @@ fun AppearanceScreen(
                             Switch(
                                 checked = currentDarkTheme == DarkThemePreference.Dark,
                                 onCheckedChange = ::updateDarkTheme
+                            )
+                        }
+                    )
+                }
+                item {
+                    val oledDarkThemeEnabled by context.oledDarkThemeFlow()
+                        .collectAsStateWithLifecycle(initialValue = false)
+                    SettingItemRow(
+                        title = "OLED Pure Black Theme",
+                        desc = if (oledDarkThemeEnabled) "Enabled" else "Disabled",
+                        icon = Icons.Outlined.Palette,
+                        onClick = {
+                            scope.launch {
+                                context.putOLEDDarkTheme(!oledDarkThemeEnabled)
+                            }
+                        },
+                        action = {
+                            Switch(
+                                checked = oledDarkThemeEnabled,
+                                onCheckedChange = { value ->
+                                    scope.launch {
+                                        context.putOLEDDarkTheme(value)
+                                    }
+                                }
                             )
                         }
                     )

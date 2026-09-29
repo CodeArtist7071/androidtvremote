@@ -82,6 +82,12 @@ class WebServer(
         val end = startAndEnd?.second ?: (fileSize - 1L).coerceAtLeast(0L)
         val contentLength = if (fileSize >= 0L) (end - start + 1L).coerceAtLeast(0L) else -1L
 
+        android.util.Log.d(
+            "WebServer",
+            "Serving ${entry.displayName} [${entry.mimeType}] " +
+            "range=${rangeHeader ?: "none"} start=$start end=$end size=$fileSize"
+        )
+
         val fileInputStream = ParcelFileDescriptor.AutoCloseInputStream(parcelFileDescriptor).apply {
             if (start > 0L) {
                 channel.position(start)
@@ -95,15 +101,26 @@ class WebServer(
             }
         )
 
+        // ── HEVC/H.265 codec hint ──────────────────────────────────────────────
+        // Cast receivers may not auto-detect HEVC from a bare "video/mp4" Content-Type.
+        // Appending a codec profile hint allows the receiver to pick the right
+        // hardware decoder. Profile hev1.1.6.L93.B0 covers most common 4K HEVC streams.
+        // ──────────────────────────────────────────────────────────────────────────
+        val effectiveMimeType = if (isHevcMime(entry.mimeType)) {
+            "${entry.mimeType}; codecs=\"hev1.1.6.L93.B0\""
+        } else {
+            entry.mimeType
+        }
+
         val response = if (contentLength >= 0L) {
             newFixedLengthResponse(
                 if (startAndEnd != null) Response.Status.PARTIAL_CONTENT else Response.Status.OK,
-                entry.mimeType,
+                effectiveMimeType,
                 inputStream,
                 contentLength
             )
         } else {
-            newChunkedResponse(Response.Status.OK, entry.mimeType, inputStream)
+            newChunkedResponse(Response.Status.OK, effectiveMimeType, inputStream)
         }
 
         response.addHeader("Access-Control-Allow-Origin", "*")
@@ -113,6 +130,20 @@ class WebServer(
             response.addHeader("Content-Range", "bytes $start-$end/$fileSize")
         }
         return response
+    }
+
+    /**
+     * Returns true if the MIME type indicates HEVC/H.265 content.
+     * Covers the common variants: video/hevc, video/x-hevc, and video/mp4 files
+     * that have been registered with an HEVC-specific MIME.
+     */
+    private fun isHevcMime(mimeType: String): Boolean {
+        val lower = mimeType.lowercase()
+        return lower.contains("hevc") ||
+            lower.contains("hev1") ||
+            lower.contains("hvc1") ||
+            lower.contains("h265") ||
+            lower.contains("h.265")
     }
 
     private fun parseRange(rangeHeader: String?, fileSize: Long): Pair<Long, Long>? {

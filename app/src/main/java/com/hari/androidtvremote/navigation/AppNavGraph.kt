@@ -34,6 +34,9 @@ import com.hari.androidtvremote.ui.app.DeviceDiscoveryScreen
 import com.hari.androidtvremote.ui.app.AppearanceScreen
 import com.hari.androidtvremote.ui.app.HomeScreen
 import com.hari.androidtvremote.ui.app.HomeTab
+import com.hari.androidtvremote.ui.app.ManageShortcutsScreen
+import com.hari.androidtvremote.ui.app.CustomizeLayoutScreen
+import com.hari.androidtvremote.ui.app.DonationScreen
 import com.hari.androidtvremote.ui.app.MediaItemUi
 import com.hari.androidtvremote.ui.app.MediaKind
 import com.hari.androidtvremote.ui.app.OnboardingScreen
@@ -48,6 +51,10 @@ import com.hari.androidtvremote.ui.app.decodeRemoteShortcutOrder
 import com.hari.androidtvremote.ui.app.encodeRemoteShortcutOrder
 import com.hari.androidtvremote.ui.app.queryPhotosInAlbum
 import com.hari.androidtvremote.ui.app.resolveRemoteShortcutApps
+import com.hari.androidtvremote.ui.app.QuickLaunchOrderScreen
+import com.hari.androidtvremote.ui.app.ShortcutsDataStore
+import com.hari.androidtvremote.ui.app.getAllKnownShortcutApps
+import com.hari.androidtvremote.ui.app.getDefaultRemoteShortcutApps
 import com.hari.androidtvremote.utils.Constant
 import com.hari.androidtvremote.androidLib.remote.Remotemessage
 import com.hari.androidtvremote.ui.app.toggleNumberPad
@@ -103,13 +110,27 @@ fun AppNavGraph(
     )
     val sessionState by tvRemoteViewModel.uiState.collectAsStateWithLifecycle()
 
-    var currentTab by rememberSaveable { mutableStateOf(HomeTab.Remote) }
+    val workingTab = rememberSaveable { mutableStateOf(HomeTab.Remote) }
+    var currentTab by workingTab
+
+    // ── Centralized Connection Guard Navigation trigger ──
+    val navigateToDiscovery by tvRemoteViewModel.navigateToDiscoveryTrigger.collectAsStateWithLifecycle()
+    LaunchedEffect(navigateToDiscovery) {
+        if (navigateToDiscovery) {
+            if (navController.currentDestination?.route != Screen.Discovery.route) {
+                navController.navigate(Screen.Discovery.route) {
+                    launchSingleTop = true
+                }
+            }
+            tvRemoteViewModel.resetDiscoveryTrigger()
+        }
+    }
     var defaultPadMode by rememberSaveable {
         mutableStateOf(
-            prefs.getString(Constant.PREF_DEFAULT_PAD_MODE, RemotePadMode.Touchpad.name)
+            prefs.getString(Constant.PREF_DEFAULT_PAD_MODE, RemotePadMode.DPad.name)
                 ?.let { value -> RemotePadMode.entries.firstOrNull { it.name == value } }
                 ?.takeIf { it != RemotePadMode.NumberPad }
-                ?: RemotePadMode.Touchpad
+                ?: RemotePadMode.DPad
         )
     }
     var activePadMode by rememberSaveable { mutableStateOf(defaultPadMode) }
@@ -133,13 +154,34 @@ fun AppNavGraph(
             }
         )
     }
+    val customShortcuts by ShortcutsDataStore.shortcutsFlow(context)
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+
     var remoteAppOrder by rememberSaveable {
         mutableStateOf(
             decodeRemoteShortcutOrder(
-                prefs.getString(Constant.PREF_REMOTE_APP_ORDER, null)
+                prefs.getString(Constant.PREF_REMOTE_APP_ORDER, null),
+                customShortcuts
             )
         )
     }
+
+    LaunchedEffect(customShortcuts) {
+        val defaultIds = getDefaultRemoteShortcutApps().map { it.id }.toSet()
+        val customIds = customShortcuts.map { it.id }.toSet()
+
+        val validExisting = remoteAppOrder.filter { it in defaultIds || it in customIds }
+        val missingCustom = customShortcuts.map { it.id }.filter { it !in validExisting }
+        val newOrder = validExisting + missingCustom
+        if (newOrder != remoteAppOrder) {
+            remoteAppOrder = newOrder
+        }
+    }
+
+    val resolvedRemoteApps = remember(remoteAppOrder, customShortcuts) {
+        resolveRemoteShortcutApps(remoteAppOrder, customShortcuts)
+    }
+
     LaunchedEffect(defaultPadMode) {
         prefs.edit { putString(Constant.PREF_DEFAULT_PAD_MODE, defaultPadMode.name) }
     }
@@ -241,7 +283,7 @@ fun AppNavGraph(
                 hapticsEnabled = hapticsEnabled,
                 defaultPadMode = defaultPadMode,
                 remoteShelfMode = remoteShelfMode,
-                remoteApps = resolveRemoteShortcutApps(remoteAppOrder),
+                remoteApps = resolvedRemoteApps,
                 onTabSelected = { tab ->
                     currentTab = tab
                 },
@@ -249,7 +291,11 @@ fun AppNavGraph(
                     activePadMode = activePadMode.toggleNumberPad(defaultPadMode)
                 },
                 onOpenDiscovery = {
-                    navController.navigate(Screen.Discovery.route)
+                    if (navController.currentDestination?.route != Screen.Discovery.route) {
+                        navController.navigate(Screen.Discovery.route) {
+                            launchSingleTop = true
+                        }
+                    }
                 },
                 onOpenSettings = {
                     navController.navigate(Screen.Settings.route)
@@ -259,6 +305,7 @@ fun AppNavGraph(
                 },
                 onQuickApp = tvRemoteViewModel::launchQuickApp,
                 onRemoteKey = tvRemoteViewModel::sendKey,
+                onClearStatus = tvRemoteViewModel::clearStatus,
                 onVolumeChanged = tvRemoteViewModel::setVolume,
                 onVolumeUp = tvRemoteViewModel::volumeUp,
                 onVolumeDown = tvRemoteViewModel::volumeDown,
@@ -277,20 +324,40 @@ fun AppNavGraph(
         }
         composable(Screen.Discovery.route) {
             val initiallyConnectedDeviceId = remember { sessionState.connectedDevice?.id }
+            var hasDisconnectedWhileHere by remember { mutableStateOf(false) }
+            var connectRequested by remember { mutableStateOf(false) }
+
             LaunchedEffect(sessionState.connectedDevice?.id) {
                 val connectedId = sessionState.connectedDevice?.id
-                if (connectedId != null && connectedId != initiallyConnectedDeviceId) {
-                    navController.popBackStack()
+                if (connectedId == null) {
+                    hasDisconnectedWhileHere = true
+                } else if (hasDisconnectedWhileHere || connectRequested || connectedId != initiallyConnectedDeviceId) {
+                    if (navController.currentDestination?.route == Screen.Discovery.route) {
+                        navController.popBackStack()
+                    }
                 }
             }
             DeviceDiscoveryScreen(
                 sessionState = sessionState,
                 onBack = { navController.popBackStack() },
                 onRefresh = tvRemoteViewModel::refreshDiscoveredDevices,
-                onConnect = tvRemoteViewModel::connectToDevice,
-                onDisconnect = tvRemoteViewModel::disconnectCurrentDevice,
-                onSubmitPairingCode = tvRemoteViewModel::submitPairingCode,
-                onCancelPairing = tvRemoteViewModel::cancelPairing,
+                onConnect = { deviceId ->
+                    connectRequested = true
+                    tvRemoteViewModel.connectToDevice(deviceId)
+                },
+                onDisconnect = {
+                    hasDisconnectedWhileHere = true
+                    connectRequested = false
+                    tvRemoteViewModel.disconnectCurrentDevice()
+                },
+                onSubmitPairingCode = { code ->
+                    connectRequested = true
+                    tvRemoteViewModel.submitPairingCode(code)
+                },
+                onCancelPairing = {
+                    connectRequested = false
+                    tvRemoteViewModel.cancelPairing()
+                },
                 onClearStatus = tvRemoteViewModel::clearStatus
             )
         }
@@ -302,6 +369,7 @@ fun AppNavGraph(
                 onBack = { navController.popBackStack() },
                 onOpenRemoteControls = { navController.navigate(Screen.RemoteControls.route) },
                 onOpenAppearance = { navController.navigate(Screen.Appearance.route) },
+                onOpenDonation = { navController.navigate(Screen.Donation.route) },
                 onOpenTipsSupport = { navController.navigate(Screen.TipsSupport.route) },
                 onAutoReconnectChange = { autoReconnectEnabled = it },
             )
@@ -312,7 +380,7 @@ fun AppNavGraph(
                 hapticsEnabled = hapticsEnabled,
                 keepScreenAwake = keepScreenAwake,
                 remoteShelfMode = remoteShelfMode,
-                remoteApps = resolveRemoteShortcutApps(remoteAppOrder),
+                remoteApps = resolvedRemoteApps,
                 onBack = { navController.popBackStack() },
                 onDefaultPadModeChange = {
                     defaultPadMode = it
@@ -321,9 +389,15 @@ fun AppNavGraph(
                 onHapticsChange = { hapticsEnabled = it },
                 onKeepScreenAwakeChange = { keepScreenAwake = it },
                 onRemoteShelfModeChange = { remoteShelfMode = it },
-                onRemoteAppOrderChange = { newOrder ->
-                    remoteAppOrder = newOrder
+                onOpenQuickLaunchOrder = {
+                    navController.navigate(Screen.QuickLaunchOrder.route)
                 },
+                onOpenManageShortcuts = {
+                    navController.navigate(Screen.ManageShortcuts.route)
+                },
+                onOpenCustomizeLayout = {
+                    navController.navigate(Screen.CustomizeLayout.route)
+                }
             )
         }
         composable(Screen.Appearance.route) {
@@ -333,6 +407,44 @@ fun AppNavGraph(
         }
         composable(Screen.TipsSupport.route) {
             TipsSupportScreen(
+                onBack = { navController.popBackStack() }
+            )
+        }
+
+        // ── Quick launch app order ───────────────────────────────────────────
+        composable(Screen.QuickLaunchOrder.route) {
+            QuickLaunchOrderScreen(
+                remoteApps = resolvedRemoteApps,
+                allAvailableApps = getAllKnownShortcutApps(customShortcuts),
+                onBack = { navController.popBackStack() },
+                onRemoteAppOrderChange = { newOrder ->
+                    remoteAppOrder = newOrder
+                }
+            )
+        }
+
+        // ── Manage custom shortcuts ──────────────────────────────────────────
+        composable(Screen.ManageShortcuts.route) {
+            ManageShortcutsScreen(
+                remoteApps = resolvedRemoteApps,
+                onBack = { navController.popBackStack() },
+                onRemoteAppOrderChange = { newOrder ->
+                    remoteAppOrder = newOrder
+                },
+                onTestShortcut = tvRemoteViewModel::launchCustomShortcut
+            )
+        }
+
+        // ── Customize remote layout ──────────────────────────────────────────
+        composable(Screen.CustomizeLayout.route) {
+            CustomizeLayoutScreen(
+                onBack = { navController.popBackStack() }
+            )
+        }
+
+        // ── Donation ─────────────────────────────────────────────────────────
+        composable(Screen.Donation.route) {
+            DonationScreen(
                 onBack = { navController.popBackStack() }
             )
         }
@@ -353,13 +465,18 @@ fun AppNavGraph(
                 mediaItem = activeMedia,
                 deviceName = sessionState.connectedDevice?.name,
                 castState = sessionState.cast,
+                volumeFraction = sessionState.volumeFraction,
+                isMuted = sessionState.isMuted,
                 onBack = {
-                    tvRemoteViewModel.clearCastMedia()
                     navController.popBackStack()
                 },
                 onTogglePlayback = tvRemoteViewModel::togglePlayback,
                 onSeekTo = tvRemoteViewModel::seekTo,
                 onStopCasting = tvRemoteViewModel::stopCasting,
+                onVolumeChanged = tvRemoteViewModel::setVolume,
+                onToggleMute = {
+                    tvRemoteViewModel.sendKey(Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_MUTE)
+                },
                 albumItems = albumItems,
                 onCastOther = { photo ->
                     tvRemoteViewModel.castMedia(photo)

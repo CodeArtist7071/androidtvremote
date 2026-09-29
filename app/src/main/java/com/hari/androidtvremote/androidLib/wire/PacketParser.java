@@ -6,7 +6,7 @@ import java.io.InputStream;
 public abstract class PacketParser extends Thread {
     private final InputStream mInputStream;
 
-    private boolean isAbort = false;
+    private volatile boolean isAbort = false;
 
     public PacketParser(InputStream inputStream) {
         mInputStream = inputStream;
@@ -32,6 +32,7 @@ public abstract class PacketParser extends Thread {
 
     @Override
     public void run() {
+        boolean streamClosed = false;
         while (!isAbort) {
             try {
                 int available = readVarint();
@@ -39,6 +40,7 @@ public abstract class PacketParser extends Thread {
                 if (available < 0) {
                     // Stream closed
                     isAbort = true;
+                    streamClosed = true;
                     break;
                 }
                 if (available == 0) continue;
@@ -49,6 +51,7 @@ public abstract class PacketParser extends Thread {
                     int read = mInputStream.read(buf, bytesRead, available - bytesRead);
                     if (read < 0) {
                         isAbort = true;
+                        streamClosed = true;
                         break;
                     }
                     bytesRead += read;
@@ -57,15 +60,44 @@ public abstract class PacketParser extends Thread {
                 if (!isAbort) {
                     messageBufferReceived(buf);
                 }
+            } catch (java.net.SocketTimeoutException e) {
+                // Read timed out while waiting for next packet — socket is still alive, continue waiting
+                continue;
             } catch (IOException e) {
+                if (!isAbort) {
+                    // Unexpected IOException (not caused by our own abort close)
+                    e.printStackTrace();
+                    streamClosed = true;
+                }
                 isAbort = true;
-                e.printStackTrace();
             }
+        }
+        if (streamClosed) {
+            onStreamClosed();
         }
     }
 
+    /**
+     * Abort the parser.
+     *
+     * Sets the abort flag AND closes the InputStream so any thread that is
+     * currently blocked inside a native read() call (readVarint or the
+     * byte-buffer read loop) receives an IOException immediately. Without
+     * this close, the thread would remain blocked until the OS socket idle
+     * timeout fires (typically 75–120 s), keeping the connection in a
+     * zombie state.
+     */
     public void abort() {
         isAbort = true;
+        try {
+            mInputStream.close();
+        } catch (IOException ignored) {
+            // Ignore — we are tearing down the session anyway
+        }
+    }
+
+    protected void onStreamClosed() {
+        // Subclasses can override to notify listeners
     }
 
     public abstract void messageBufferReceived(byte[] buf);

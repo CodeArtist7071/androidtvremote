@@ -153,7 +153,13 @@ public class CastDiscoveryProvider implements DiscoveryProvider {
             super.onRouteAdded(router, route);
 
             CastDevice castDevice = CastDevice.getFromBundle(route.getExtras());
+            if (castDevice == null || castDevice.getIpAddress() == null) {
+                return;
+            }
             String uuid = castDevice.getDeviceId();
+            if (uuid == null) {
+                return;
+            }
 
             removedUUID.remove(uuid);
 
@@ -200,7 +206,13 @@ public class CastDiscoveryProvider implements DiscoveryProvider {
             super.onRouteChanged(router, route);
 
             CastDevice castDevice = CastDevice.getFromBundle(route.getExtras());
+            if (castDevice == null || castDevice.getIpAddress() == null) {
+                return;
+            }
             String uuid = castDevice.getDeviceId();
+            if (uuid == null) {
+                return;
+            }
 
             ServiceDescription foundService = foundServices.get(uuid);
 
@@ -209,7 +221,7 @@ public class CastDiscoveryProvider implements DiscoveryProvider {
             // TODO: NhuongNV-ADD fix chormeCast
             if (isNew) {
                 foundService = new ServiceDescription(CastService.ID, uuid,
-                        Objects.requireNonNull(castDevice.getIpAddress()).getHostAddress());
+                        castDevice.getIpAddress().getHostAddress());
                 foundService.setFriendlyName(castDevice.getFriendlyName());
                 foundService.setServiceID(CastService.ID);
                 listUpdateFlag = true;
@@ -254,7 +266,13 @@ public class CastDiscoveryProvider implements DiscoveryProvider {
             super.onRouteRemoved(router, route);
 
             CastDevice castDevice = CastDevice.getFromBundle(route.getExtras());
+            if (castDevice == null) {
+                return;
+            }
             String uuid = castDevice.getDeviceId();
+            if (uuid == null) {
+                return;
+            }
             removedUUID.add(uuid);
 
             // Prevent immediate removing. There are some cases when service is removed and added

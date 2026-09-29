@@ -10,6 +10,7 @@ import androidx.compose.ui.platform.LocalView
 
 import com.hari.androidtvremote.preference.LocalDarkTheme
 import com.hari.androidtvremote.preference.LocalThemeIndex
+import com.hari.androidtvremote.preference.LocalAmoledDarkTheme
 import com.hari.androidtvremote.ui.theme.palette.LocalTonalPalettes
 import com.hari.androidtvremote.ui.theme.palette.core.ProvideZcamViewingConditions
 import com.hari.androidtvremote.ui.theme.palette.dynamic.extractTonalPalettesFromUserWallpaper
@@ -29,7 +30,8 @@ fun AndroidTVRemoteTheme(
 ) {
     val view = LocalView.current
     val darkTheme = LocalDarkTheme.current
-    val useDark = darkTheme.isDarkTheme()
+    val useOled = LocalAmoledDarkTheme.current.value
+    val useDark = darkTheme.isDarkTheme() || useOled
 
     LaunchedEffect(useDark) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

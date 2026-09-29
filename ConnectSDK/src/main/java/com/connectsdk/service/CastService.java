@@ -301,15 +301,20 @@ public class CastService extends DeviceService implements MediaPlayer, MediaCont
 
     @Override
     public void connect() {
-        if (castDevice == null) {
+        if (castDevice == null && getServiceDescription() != null) {
             castDevice = (CastDevice) getServiceDescription().getDevice();
+        }
+
+        if (castDevice == null) {
+            Log.w(Util.T, "Cannot connect CastService: CastDevice is null");
+            return;
         }
 
         if (mApiClient == null) {
             mApiClient = createApiClient();
         }
 
-        if (!mApiClient.isConnecting() && !mApiClient.isConnected()) {
+        if (mApiClient != null && !mApiClient.isConnecting() && !mApiClient.isConnected()) {
             mApiClient.connect();
         }
     }

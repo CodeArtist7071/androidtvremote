@@ -1,8 +1,22 @@
 package com.hari.androidtvremote.ui.app
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.Dp
+import kotlin.math.cos
+import kotlin.math.sin
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -27,6 +41,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Pause
@@ -52,6 +68,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -72,15 +90,29 @@ fun CastPlayerScreen(
     mediaItem: MediaItemUi?,
     deviceName: String?,
     castState: CastPlaybackUiState,
+    volumeFraction: Float = 0.5f,
+    isMuted: Boolean = false,
     onBack: () -> Unit,
     onTogglePlayback: () -> Unit,
     onSeekTo: (Float) -> Unit,
     onStopCasting: () -> Unit,
+    onVolumeChanged: (Float) -> Unit = {},
+    onToggleMute: () -> Unit = {},
     albumItems: List<MediaItemUi> = emptyList(),
     onCastOther: ((MediaItemUi) -> Unit)? = null
 ) {
     var progress by rememberSaveable { mutableFloatStateOf(castState.progressFraction) }
     LaunchedEffect(castState.progressFraction) { progress = castState.progressFraction }
+
+    var isStopping by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isStopping, castState.isCasting) {
+        if (isStopping && !castState.isCasting) {
+            kotlinx.coroutines.delay(350)
+            isStopping = false
+            onBack()
+        }
+    }
 
     AppBackdrop {
         Scaffold(
@@ -221,6 +253,46 @@ fun CastPlayerScreen(
                             }
                         }
 
+                        // ── Wavy Progress Bar overlay until cast starts successfully or stopping ─────
+                        val showProgress = !castState.isCasting || castState.isBusy || isStopping
+                        if (showProgress) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.55f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    CircularWavyProgressBar(
+                                        modifier = Modifier.size(72.dp),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        strokeWidth = 6.dp,
+                                        waveCount = 8,
+                                        waveAmplitude = 3.dp
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(50),
+                                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
+                                    ) {
+                                        Text(
+                                            text = when {
+                                                isStopping -> "Stopping cast..."
+                                                castState.isBusy -> "Connecting to TV..."
+                                                else -> "Preparing stream..."
+                                            },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
                         // Casting status badge
                         Surface(
                             modifier = Modifier
@@ -327,6 +399,39 @@ fun CastPlayerScreen(
                             )
                         }
 
+                        // Live TV Volume Slider for Audio & Video
+                        if (mediaItem.kind != MediaKind.Photo) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                IconButton(
+                                    onClick = onToggleMute,
+                                    modifier = Modifier.size(36.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
+                                        contentDescription = if (isMuted) "Unmute" else "Mute",
+                                        tint = if (isMuted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                var currentVolFraction by remember(volumeFraction) { mutableFloatStateOf(volumeFraction) }
+                                Slider(
+                                    value = currentVolFraction,
+                                    onValueChange = { currentVolFraction = it },
+                                    onValueChangeFinished = { onVolumeChanged(currentVolFraction) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = "${(currentVolFraction * 100).toInt()}%",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
                         // Playback controls
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -335,7 +440,10 @@ fun CastPlayerScreen(
                         ) {
                             // Stop
                             FilledTonalIconButton(
-                                onClick = onStopCasting,
+                                onClick = {
+                                    isStopping = true
+                                    onStopCasting()
+                                },
                                 modifier = Modifier.size(48.dp)
                             ) {
                                 Icon(
@@ -416,4 +524,64 @@ private fun formatCastDuration(durationMs: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%d:%02d".format(minutes, seconds)
+}
+
+@Composable
+private fun CircularWavyProgressBar(
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.primary,
+    strokeWidth: Dp = 6.dp,
+    waveCount: Int = 8,
+    waveAmplitude: Dp = 3.dp
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "wavyProgress")
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1600, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wavyRotation"
+    )
+    val wavePhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wavyPhase"
+    )
+
+    Canvas(modifier = modifier.graphicsLayer { rotationZ = rotation }) {
+        val diameter = size.minDimension
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val baseRadius = (diameter - strokeWidth.toPx() - (waveAmplitude.toPx() * 2f)) / 2f
+        val strokePx = strokeWidth.toPx()
+        val ampPx = waveAmplitude.toPx()
+
+        val path = Path()
+        val steps = 360
+        for (i in 0..steps) {
+            val angleRad = Math.toRadians(i.toDouble()).toFloat()
+            val r = baseRadius + (sin((angleRad * waveCount) + wavePhase) * ampPx)
+            val x = center.x + (r * cos(angleRad))
+            val y = center.y + (r * sin(angleRad))
+            if (i == 0) {
+                path.moveTo(x, y)
+            } else {
+                path.lineTo(x, y)
+            }
+        }
+
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(
+                width = strokePx,
+                cap = StrokeCap.Round
+            )
+        )
+    }
 }

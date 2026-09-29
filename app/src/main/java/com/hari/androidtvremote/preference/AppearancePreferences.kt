@@ -22,6 +22,7 @@ object AppearanceKeys {
     val BASIC_FONT = intPreferencesKey("basic_font")
     val CUSTOM_PRIMARY_COLOR = stringPreferencesKey("custom_primary_color")
     val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
+    val OLED_DARK_THEME = booleanPreferencesKey("oled_dark_theme")
 }
 
 // ─── CompositionLocals ───────────────────────────────────────────────────────
@@ -60,4 +61,11 @@ suspend fun Context.putBasicFont(value: Int) {
 
 suspend fun Context.putCustomColor(value: String) {
     appearanceDataStore.edit { it[AppearanceKeys.CUSTOM_PRIMARY_COLOR] = value }
+}
+
+fun Context.oledDarkThemeFlow(): Flow<Boolean> =
+    appearanceDataStore.data.map { it[AppearanceKeys.OLED_DARK_THEME] ?: false }
+
+suspend fun Context.putOLEDDarkTheme(value: Boolean) {
+    appearanceDataStore.edit { it[AppearanceKeys.OLED_DARK_THEME] = value }
 }

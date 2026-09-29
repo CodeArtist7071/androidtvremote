@@ -5,9 +5,16 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import kotlin.math.sin
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +31,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -38,9 +47,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForwardIos
 import androidx.compose.material.icons.automirrored.filled.KeyboardBackspace
 import androidx.compose.material.icons.automirrored.filled.VolumeMute
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.ArrowBackIosNew
+import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.PowerSettingsNew
 
 import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FastRewind
@@ -49,6 +63,7 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Stop
@@ -64,12 +79,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -119,6 +136,7 @@ fun RemoteScreen(
     sessionState: TvRemoteUiState,
     remoteShelfMode: RemoteShelfMode,
     quickApps: List<RemoteShortcutApp>,
+    hapticsEnabled: Boolean,
     onRequireConnection: () -> Unit,
     onCyclePadMode: () -> Unit,
     onQuickApp: (String) -> Unit,
@@ -131,6 +149,43 @@ fun RemoteScreen(
     onToggleVoice: () -> Unit,
 ) {
     val context = LocalContext.current
+    val view = androidx.compose.ui.platform.LocalView.current
+    fun performHaptic() {
+        if (hapticsEnabled) {
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+        }
+    }
+
+    val wrappedOnRemoteKey: (Remotemessage.RemoteKeyCode) -> Unit = { key ->
+        performHaptic()
+        onRemoteKey(key)
+    }
+
+    val wrappedOnVolumeUp: () -> Unit = {
+        performHaptic()
+        onVolumeUp()
+    }
+
+    val wrappedOnVolumeDown: () -> Unit = {
+        performHaptic()
+        onVolumeDown()
+    }
+
+    val wrappedOnQuickApp: (String) -> Unit = { appId ->
+        performHaptic()
+        onQuickApp(appId)
+    }
+
+    val wrappedOnCyclePadMode: () -> Unit = {
+        performHaptic()
+        onCyclePadMode()
+    }
+
+    val wrappedOnToggleVoice: () -> Unit = {
+        performHaptic()
+        onToggleVoice()
+    }
+
     var hasMicPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
@@ -141,7 +196,7 @@ fun RemoteScreen(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasMicPermission = granted
-        if (granted) onToggleVoice()
+        if (granted) wrappedOnToggleVoice()
     }
 
     val isConnected = sessionState.connectedDevice != null
@@ -150,22 +205,22 @@ fun RemoteScreen(
             RemoteMediaAction(
                 icon = Icons.Filled.FastRewind,
                 contentDescription = "Rewind",
-                onClick = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_REWIND) }
+                onClick = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_REWIND) }
             ),
             RemoteMediaAction(
                 icon = Icons.Filled.PlayArrow,
                 contentDescription = "Play or pause",
-                onClick = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_PLAY_PAUSE) }
+                onClick = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_PLAY_PAUSE) }
             ),
             RemoteMediaAction(
                 icon = Icons.Filled.FastForward,
                 contentDescription = "Fast forward",
-                onClick = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_FAST_FORWARD) }
+                onClick = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_FAST_FORWARD) }
             ),
             RemoteMediaAction(
                 icon = Icons.Filled.Stop,
                 contentDescription = "Stop",
-                onClick = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_STOP) }
+                onClick = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_STOP) }
             )
         )
     }
@@ -224,66 +279,96 @@ fun RemoteScreen(
             maxWidth - (horizontalPadding * 2),
             if (hasTopStrip) maxHeight * 0.44f else maxHeight * 0.52f,
             352.dp
-        ).coerceAtLeast(300.dp)
+        ).coerceAtLeast(350.dp)
+
+        // Load custom remote layout configuration
+        val layoutConfig by remember(context) { RemoteLayoutDataStore.layoutConfigFlow(context) }
+            .collectAsStateWithLifecycle(initialValue = RemoteLayoutConfig.default)
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
                 .padding(horizontal = horizontalPadding, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(verticalGap)
         ) {
-            when (remoteShelfMode) {
-                RemoteShelfMode.Applications -> AppShortcutStrip(
-                    quickApps = quickApps,
-                    onQuickApp = onQuickApp,
-                    shortcutSize = shelfButtonSize
-                )
-
-                RemoteShelfMode.MediaButtons -> MediaButtonStrip(
-                    actions = mediaActions,
-                    buttonSize = shelfButtonSize
-                )
-
-                RemoteShelfMode.None -> Unit
-            }
-
-            Spacer(modifier = Modifier.height(15.dp))
-            RemotePadStage(
-                activePadMode = activePadMode,
-                stageHeight = padStageHeight,
-                onAction = onRemoteKey
-            )
-            RemotePageIndicator(
-                isSecondarySelected = isNumberPadVisible
-            )
-            Spacer(modifier = Modifier.height(15.dp))
-
-            RemoteControlDeck(
-                isVoiceActive = sessionState.isVoiceActive,
-                isNumberPadVisible = isNumberPadVisible,
-                primaryPadMode = primaryPadMode,
-                rockerWidth = rockerWidth,
-                rockerHeight = rockerHeight,
-                controlSpacing = controlSpacing,
-                actionIconSize = actionIconSize,
-                onKeyboard = ::handleKeyboardOpen,
-                onHome = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_HOME) },
-                onSwitchPad = onCyclePadMode,
-                onMute = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_MUTE) },
-                onVoice = {
-                    if (hasMicPermission) {
-                        onToggleVoice()
-                    } else {
-                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            for (section in layoutConfig.sectionOrder) {
+                when (section) {
+                    RemoteLayoutConfig.SECTION_POWER -> {
+                        PowerRow(
+                            onPower = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_POWER) },
+                            actionIconSize = actionIconSize
+                        )
                     }
-                },
-                onBack = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_BACK) },
-                onVolumeDown = onVolumeDown,
-                onVolumeUp = onVolumeUp,
-                onChannelUp = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_CHANNEL_UP) },
-                onChannelDown = { onRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_CHANNEL_DOWN) }
-            )
+                    RemoteLayoutConfig.SECTION_TOP_STRIP -> {
+                        when (remoteShelfMode) {
+                            RemoteShelfMode.Applications -> AppShortcutStrip(
+                                quickApps = quickApps,
+                                onQuickApp = wrappedOnQuickApp,
+                                shortcutSize = shelfButtonSize
+                            )
+
+                            RemoteShelfMode.MediaButtons -> MediaButtonStrip(
+                                actions = mediaActions,
+                                buttonSize = shelfButtonSize
+                            )
+
+                            RemoteShelfMode.None -> Unit
+                        }
+                    }
+                    RemoteLayoutConfig.SECTION_DPAD_STAGE -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        RemotePadStage(
+                            activePadMode = activePadMode,
+                            stageHeight = padStageHeight,
+                            isConnected = isConnected,
+                            hapticsEnabled = hapticsEnabled,
+                            onAction = onRemoteKey
+                        )
+//                        RemotePageIndicator(
+//                            isSecondarySelected = isNumberPadVisible
+//                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
+                    RemoteLayoutConfig.SECTION_CONTROL_DECK -> {
+
+                        Box(modifier = Modifier.weight(1f)) {
+                            RemoteControlDeck(
+                                isVoiceActive = sessionState.isVoiceActive,
+                                isMuted = sessionState.isMuted,
+                                volumeLevel = sessionState.volumeLevel,
+                                volumeFraction = sessionState.volumeFraction,
+                                isNumberPadVisible = isNumberPadVisible,
+                                primaryPadMode = primaryPadMode,
+                                rockerWidth = rockerWidth,
+                                controlSpacing = controlSpacing,
+                                actionIconSize = actionIconSize,
+                                onKeyboard = ::handleKeyboardOpen,
+                                onHome = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_HOME) },
+                                onSwitchPad = wrappedOnCyclePadMode,
+                                onMute = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_VOLUME_MUTE) },
+                                onVoice = {
+                                    if (hasMicPermission) {
+                                        wrappedOnToggleVoice()
+                                    } else {
+                                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                onBack = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_BACK) },
+                                onVolumeDown = wrappedOnVolumeDown,
+                                onVolumeUp = wrappedOnVolumeUp,
+                                onChannelUp = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_CHANNEL_UP) },
+                                onChannelDown = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_CHANNEL_DOWN) },
+                                onRecentApps = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_APP_SWITCH) },
+                                onPlayPause = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MEDIA_PLAY_PAUSE) },
+                                onPowerMini = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_POWER) },
+                                onMenu = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_MENU) },
+                                onPower = { wrappedOnRemoteKey(Remotemessage.RemoteKeyCode.KEYCODE_POWER) },
+                                layoutConfig = layoutConfig
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -307,38 +392,24 @@ private fun AppShortcutStrip(
         modifier = Modifier
             .fillMaxWidth()
             .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         quickApps.forEach { app ->
-            Column(
-                modifier = Modifier.width(shortcutSize + 10.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+            FilledTonalButton(
+                onClick = { onQuickApp(app.intentUri ?: app.launchName) },
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                ),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                modifier = Modifier.height(shortcutSize * 0.6f)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(shortcutSize)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(
-                            Brush.linearGradient(
-                                listOf(app.accent, app.accentSecondary)
-                            )
-                        )
-                        .clickable { onQuickApp(app.launchName) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = app.mark,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color.White
-                    )
-                }
                 Text(
                     text = app.label,
-                    style = MaterialTheme.typography.labelSmall,
-                    textAlign = TextAlign.Center,
-                    maxLines = 2,
-                    color = MaterialTheme.colorScheme.onSurface
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    textAlign = TextAlign.Center
                 )
             }
         }
@@ -384,8 +455,11 @@ private fun MediaButtonStrip(
 private fun RemotePadStage(
     activePadMode: RemotePadMode,
     stageHeight: Dp,
+    isConnected: Boolean,
+    hapticsEnabled: Boolean,
     onAction: (Remotemessage.RemoteKeyCode) -> Unit,
 ) {
+    val view = androidx.compose.ui.platform.LocalView.current
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
@@ -399,18 +473,26 @@ private fun RemotePadStage(
             when (mode) {
                 RemotePadMode.DPad -> GoogleTvDPad(
                     size = basePadSize,
+                    hapticsEnabled = hapticsEnabled,
                     onAction = onAction
                 )
 
                 RemotePadMode.Touchpad -> TouchpadPanel(
                     width = widePadWidth,
                     height = basePadSize,
+                    isConnected = isConnected,
+                    hapticsEnabled = hapticsEnabled,
                     onAction = onAction
                 )
 
                 RemotePadMode.NumberPad -> NumberPadPanel(
                     width = widePadWidth,
-                    onAction = onAction
+                    onAction = { key ->
+                        if (hapticsEnabled) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+                        }
+                        onAction(key)
+                    }
                 )
             }
         }
@@ -447,10 +529,12 @@ private fun RemotePageIndicator(
 @Composable
 private fun RemoteControlDeck(
     isVoiceActive: Boolean,
+    isMuted: Boolean = false,
+    volumeLevel: Int? = null,
+    volumeFraction: Float = 0.5f,
     isNumberPadVisible: Boolean,
     primaryPadMode: RemotePadMode,
     rockerWidth: Dp,
-    rockerHeight: Dp,
     controlSpacing: Dp,
     actionIconSize: Dp,
     onKeyboard: () -> Unit,
@@ -463,99 +547,299 @@ private fun RemoteControlDeck(
     onVolumeUp: () -> Unit,
     onChannelUp: () -> Unit,
     onChannelDown: () -> Unit,
+    onRecentApps: () -> Unit,
+    onPlayPause: () -> Unit,
+    onPowerMini: () -> Unit,
+    onMenu: () -> Unit,
+    onPower: () -> Unit,
+    layoutConfig: RemoteLayoutConfig
 ) {
+    val currentFraction = volumeFraction.takeIf { it > 0f }
+        ?: (((volumeLevel ?: 50) / 100f).coerceIn(0f, 1f))
+
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(),
         horizontalArrangement = Arrangement.spacedBy(controlSpacing),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        RemoteVerticalRocker(
-            modifier = Modifier.width(rockerWidth),
-            label = "VOL",
-            topIcon = Icons.Filled.Add,
-            bottomIcon = Icons.Filled.Remove,
-            height = rockerHeight,
-            iconSize = actionIconSize,
-            containerColors = listOf(
-                MaterialTheme.colorScheme.secondaryContainer,
-                MaterialTheme.colorScheme.surfaceContainerHigh
-            ),
-            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-            onTopClick = onVolumeUp,
-            onBottomClick = onVolumeDown
-        )
+        // ── Render Left Rocker ────────────────────────────────────────────────
+        when (layoutConfig.leftRocker) {
+            RemoteLayoutConfig.ROCKER_VOLUME -> {
+                RemoteVerticalRocker(
+                    modifier = Modifier.width(rockerWidth).fillMaxHeight(),
+                    label = "VOL",
+                    fluidLevel = currentFraction,
+                    isMuted = isMuted,
+                    topIcon = Icons.Filled.Add,
+                    bottomIcon = Icons.Filled.Remove,
+                    iconSize = actionIconSize,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    onTopClick = onVolumeUp,
+                    onBottomClick = onVolumeDown
+                )
+            }
+            RemoteLayoutConfig.ROCKER_CHANNEL -> {
+                RemoteVerticalRocker(
+                    modifier = Modifier.width(rockerWidth).fillMaxHeight(),
+                    label = "CH",
+                    topIcon = Icons.Filled.KeyboardArrowUp,
+                    bottomIcon = Icons.Filled.KeyboardArrowDown,
+                    iconSize = actionIconSize,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    onTopClick = onChannelUp,
+                    onBottomClick = onChannelDown
+                )
+            }
+        }
+
+        // ── Render Middle button grid ─────────────────────────────────────────
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(controlSpacing)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(controlSpacing)
-            ) {
-                RemoteActionBubble(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Filled.Keyboard,
-                    contentDescription = "Keyboard",
-                    onClick = onKeyboard,
-                    iconSize = actionIconSize
-                )
-                RemoteActionBubble(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Filled.Home,
-                    contentDescription = "Home",
-                    onClick = onHome,
-                    iconSize = actionIconSize
-                )
-                RemoteSwitcherBubble(
-                    modifier = Modifier.weight(1f),
-                    checked = isNumberPadVisible,
-                    primaryPadMode = primaryPadMode,
-                    onClick = onSwitchPad,
-                    iconSize = actionIconSize
+            val buttonRows = layoutConfig.gridButtons.chunked(3)
+            buttonRows.forEach { rowButtons ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(controlSpacing)
+                ) {
+                    rowButtons.forEach { btn ->
+                        when (btn) {
+                            RemoteLayoutConfig.BUTTON_KEYBOARD -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.Keyboard,
+                                    contentDescription = "Keyboard",
+                                    onClick = onKeyboard,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_HOME -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.Home,
+                                    contentDescription = "Home",
+                                    onClick = onHome,
+                                    iconSize = actionIconSize,
+                                    bubbleShape = RoundedCornerShape(18.dp),
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_SWITCH_PAD -> {
+                                val currentPadMode = if (isNumberPadVisible) RemotePadMode.NumberPad else primaryPadMode
+                                RemoteSwitcherBubble(
+                                    modifier = Modifier.weight(1f),
+                                    activePadMode = currentPadMode,
+                                    onClick = onSwitchPad,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_MUTE -> {
+                                val muteIcon = if (isMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = muteIcon,
+                                    contentDescription = if (isMuted) "Unmute" else "Mute",
+                                    onClick = onMute,
+                                    emphasized = isMuted,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_VOICE -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.Mic,
+                                    contentDescription = if (isVoiceActive) "Stop voice search" else "Voice search",
+                                    onClick = onVoice,
+                                    emphasized = isVoiceActive,
+                                    iconSize = actionIconSize,
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_BACK -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.AutoMirrored.Filled.KeyboardBackspace,
+                                    contentDescription = "Back",
+                                    onClick = onBack,
+                                    iconSize = actionIconSize,
+                                    bubbleShape = CircleShape,
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_RECENT_APPS -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.Dashboard,
+                                    contentDescription = "Recent Apps",
+                                    onClick = onRecentApps,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_PLAY_PAUSE -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.PlayArrow,
+                                    contentDescription = "Play/Pause",
+                                    onClick = onPlayPause,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_POWER -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.PowerSettingsNew,
+                                    contentDescription = "Power",
+                                    onClick = onPower,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_MENU -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.Menu,
+                                    contentDescription = "Menu",
+                                    onClick = onMenu,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                            RemoteLayoutConfig.BUTTON_POWER_MINI -> {
+                                RemoteActionBubble(
+                                    modifier = Modifier.weight(1f),
+                                    icon = Icons.Filled.PowerSettingsNew,
+                                    contentDescription = "Power",
+                                    onClick = onPowerMini,
+                                    iconSize = actionIconSize
+                                )
+                            }
+                        }
+                    }
+                    if (rowButtons.size < 3) {
+                        repeat(3 - rowButtons.size) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Render Right Rocker ───────────────────────────────────────────────
+        when (layoutConfig.rightRocker) {
+            RemoteLayoutConfig.ROCKER_VOLUME -> {
+                RemoteVerticalRocker(
+                    modifier = Modifier.width(rockerWidth).fillMaxHeight(),
+                    label = "VOL",
+                    fluidLevel = currentFraction,
+                    isMuted = isMuted,
+                    topIcon = Icons.Filled.Add,
+                    bottomIcon = Icons.Filled.Remove,
+                    iconSize = actionIconSize,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    onTopClick = onVolumeUp,
+                    onBottomClick = onVolumeDown
                 )
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(controlSpacing)
-            ) {
-                RemoteActionBubble(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.AutoMirrored.Filled.VolumeMute,
-                    contentDescription = "Mute",
-                    onClick = onMute,
-                    iconSize = actionIconSize
-                )
-                RemoteActionBubble(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Filled.Mic,
-                    contentDescription = if (isVoiceActive) "Stop voice search" else "Voice search",
-                    onClick = onVoice,
-                    emphasized = isVoiceActive,
-                    iconSize = actionIconSize
-                )
-                RemoteActionBubble(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.AutoMirrored.Filled.KeyboardBackspace,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                    iconSize = actionIconSize
+            RemoteLayoutConfig.ROCKER_CHANNEL -> {
+                RemoteVerticalRocker(
+                    modifier = Modifier.width(rockerWidth).fillMaxHeight(),
+                    label = "CH",
+                    topIcon = Icons.Filled.KeyboardArrowUp,
+                    bottomIcon = Icons.Filled.KeyboardArrowDown,
+                    iconSize = actionIconSize,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    onTopClick = onChannelUp,
+                    onBottomClick = onChannelDown
                 )
             }
         }
-        RemoteVerticalRocker(
-            modifier = Modifier.width(rockerWidth),
-            label = "CH",
-            topIcon = Icons.Filled.KeyboardArrowUp,
-            bottomIcon = Icons.Filled.KeyboardArrowDown,
-            height = rockerHeight,
-            iconSize = actionIconSize,
-            containerColors = listOf(
-                MaterialTheme.colorScheme.secondaryContainer,
-                MaterialTheme.colorScheme.surfaceContainerHigh
-            ),
-            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
-            onTopClick = onChannelUp,
-            onBottomClick = onChannelDown
+    }
+}
+
+@Composable
+private fun FluidWaterCanvas(
+    modifier: Modifier = Modifier,
+    fillFraction: Float,
+    primaryColor: Color = MaterialTheme.colorScheme.primaryContainer,
+    secondaryColor: Color = MaterialTheme.colorScheme.secondaryContainer,
+    isMuted: Boolean = false
+) {
+    val animatedFill by animateFloatAsState(
+        targetValue = if (isMuted) 0f else fillFraction.coerceIn(0f, 1f),
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 350f),
+        label = "waterFillLevel"
+    )
+
+    val infiniteTransition = rememberInfiniteTransition(label = "waterWave")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wavePhase"
+    )
+
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val width = size.width
+        val height = size.height
+
+        if (width <= 0f || height <= 0f) return@Canvas
+
+        val baseWaterY = height * (1f - animatedFill)
+        val waveAmplitude = (6.dp.toPx() * (if (animatedFill > 0.05f && animatedFill < 0.95f) 1f else 0.3f))
+
+        // Secondary Wave (Back Layer)
+        val wave2Path = Path().apply {
+            moveTo(0f, height)
+            lineTo(0f, baseWaterY)
+            var x = 0f
+            while (x <= width) {
+                val relativeX = x / width
+                val y = baseWaterY + (sin((relativeX * 2f * Math.PI.toFloat()) - phase + 1.2f) * (waveAmplitude * 0.7f))
+                lineTo(x, y)
+                x += 4f
+            }
+            lineTo(width, height)
+            close()
+        }
+
+        // Primary Wave (Front Layer)
+        val wave1Path = Path().apply {
+            moveTo(0f, height)
+            lineTo(0f, baseWaterY)
+            var x = 0f
+            while (x <= width) {
+                val relativeX = x / width
+                val y = baseWaterY + (sin((relativeX * 2f * Math.PI.toFloat()) + phase) * waveAmplitude)
+                lineTo(x, y)
+                x += 4f
+            }
+            lineTo(width, height)
+            close()
+        }
+
+        drawPath(
+            path = wave2Path,
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    secondaryColor.copy(alpha = 0.40f),
+                    primaryColor.copy(alpha = 0.55f)
+                ),
+                startY = (baseWaterY - waveAmplitude).coerceAtLeast(0f),
+                endY = height
+            )
+        )
+
+        drawPath(
+            path = wave1Path,
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    primaryColor.copy(alpha = 0.65f),
+                    primaryColor.copy(alpha = 0.90f)
+                ),
+                startY = (baseWaterY - waveAmplitude).coerceAtLeast(0f),
+                endY = height
+            )
         )
     }
 }
@@ -564,30 +848,46 @@ private fun RemoteControlDeck(
 private fun RemoteVerticalRocker(
     modifier: Modifier = Modifier,
     label: String,
+    centerText: String? = null,
+    fluidLevel: Float? = null,
+    isMuted: Boolean = false,
     topIcon: ImageVector,
     bottomIcon: ImageVector,
-    height: Dp,
     iconSize: Dp,
-    containerColors: List<Color>,
     contentColor: Color,
     onTopClick: () -> Unit,
     onBottomClick: () -> Unit,
 ) {
+    var topPressed by remember { mutableStateOf(false) }
+    var bottomPressed by remember { mutableStateOf(false) }
+    val topScale by animateFloatAsState(
+        targetValue = if (topPressed) 0.94f else 1f,
+        animationSpec = spring(dampingRatio = 0.65f, stiffness = 600f),
+        label = "rockerTopScale"
+    )
+    val bottomScale by animateFloatAsState(
+        targetValue = if (bottomPressed) 0.94f else 1f,
+        animationSpec = spring(dampingRatio = 0.65f, stiffness = 600f),
+        label = "rockerBottomScale"
+    )
+    val scope = rememberCoroutineScope()
+
     Box(
         modifier = modifier
-            .height(height)
             .clip(RoundedCornerShape(30.dp))
-            .background(
-                color = MaterialTheme.colorScheme.surfaceContainerHigh
-//                Brush.verticalGradient(containerColors)
-
-            )
             .border(
                 width = 1.dp,
                 color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
                 shape = RoundedCornerShape(30.dp)
             )
     ) {
+        if (fluidLevel != null) {
+            FluidWaterCanvas(
+                fillFraction = fluidLevel,
+                isMuted = isMuted
+            )
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -598,39 +898,59 @@ private fun RemoteVerticalRocker(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .clickable(onClick = onTopClick),
+                    .scale(topScale)
+                    .clickable {
+                        topPressed = true
+                        onTopClick()
+                        scope.launch {
+                            delay(160)
+                            topPressed = false
+                        }
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = topIcon,
                     contentDescription = "$label up",
                     modifier = Modifier.size(iconSize),
-                    tint = contentColor
+                    tint = if (fluidLevel != null) MaterialTheme.colorScheme.onSurface else contentColor
                 )
             }
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                letterSpacing = 1.sp,
-                color = contentColor
-            )
+            if (centerText != null) {
+                Text(
+                    text = centerText,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    color = contentColor
+                )
+            }
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .clickable(onClick = onBottomClick),
+                    .scale(bottomScale)
+                    .clickable {
+                        bottomPressed = true
+                        onBottomClick()
+                        scope.launch {
+                            delay(160)
+                            bottomPressed = false
+                        }
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = bottomIcon,
                     contentDescription = "$label down",
                     modifier = Modifier.size(iconSize),
-                    tint = contentColor
+                    tint = if (fluidLevel != null) MaterialTheme.colorScheme.onSurface else contentColor
                 )
             }
         }
     }
 }
+
 
 @Composable
 private fun RemoteActionBubble(
@@ -640,29 +960,52 @@ private fun RemoteActionBubble(
     onClick: () -> Unit,
     emphasized: Boolean = false,
     iconSize: Dp,
+    // Optional overrides — callers use these for shape-contrast and color-hierarchy
+    bubbleShape: androidx.compose.ui.graphics.Shape = CircleShape,
+    bubbleColor: Color? = null,
+    iconTint: Color? = null,
 ) {
+    val scope = rememberCoroutineScope()
+    var pressed by remember { mutableStateOf(false) }
+    val pressScale by animateFloatAsState(
+        targetValue = if (pressed) 0.92f else 1f,
+        animationSpec = spring(dampingRatio = 0.65f, stiffness = 600f),
+        label = "bubblePressScale"
+    )
+
+    val resolvedContainerColor = bubbleColor ?: if (emphasized) {
+        MaterialTheme.colorScheme.primaryContainer
+    } else {
+        MaterialTheme.colorScheme.surfaceContainerHigh
+    }
+    val resolvedIconTint = iconTint ?: if (emphasized) {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
     FilledTonalIconButton(
         modifier = modifier
-            .aspectRatio(1f),
-        onClick = onClick,
-        shape = CircleShape,
-        colors = IconButtonDefaults.filledTonalIconButtonColors(
-            containerColor = if (emphasized) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceContainerHigh
+            .aspectRatio(1f)
+            .scale(pressScale),
+        onClick = {
+            pressed = true
+            onClick()
+            scope.launch {
+                delay(160)
+                pressed = false
             }
+        },
+        shape = bubbleShape,
+        colors = IconButtonDefaults.filledTonalIconButtonColors(
+            containerColor = resolvedContainerColor
         )
     ) {
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
             modifier = Modifier.size(iconSize),
-            tint = if (emphasized) {
-                MaterialTheme.colorScheme.onPrimaryContainer
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            }
+            tint = resolvedIconTint
         )
     }
 }
@@ -671,23 +1014,31 @@ private fun RemoteActionBubble(
 @Composable
 private fun RemoteSwitcherBubble(
     modifier: Modifier = Modifier,
-    checked: Boolean,
-    primaryPadMode: RemotePadMode,
+    activePadMode: RemotePadMode,
     onClick: () -> Unit,
     iconSize: Dp,
 ) {
+    // Show the target mode icon (the mode the user will switch TO):
+    // - When DPad is showing -> show Touchpad icon
+    // - When Touchpad is showing -> show DPad icon
+    val targetMode = when (activePadMode) {
+        RemotePadMode.DPad -> RemotePadMode.Touchpad
+        RemotePadMode.Touchpad -> RemotePadMode.DPad
+        else -> RemotePadMode.Touchpad
+    }
+    val isAlternative = activePadMode == RemotePadMode.Touchpad
+
     FilledTonalButton(
         onClick = onClick,
-        modifier = modifier
-            .aspectRatio(1f),
-        shape = RoundedCornerShape(24.dp),
+        modifier = modifier.aspectRatio(1f),
+        shape = CircleShape,
         colors = ButtonDefaults.filledTonalButtonColors(
-            containerColor = if (checked) {
+            containerColor = if (isAlternative) {
                 MaterialTheme.colorScheme.secondaryContainer
             } else {
                 MaterialTheme.colorScheme.surfaceContainerHigh
             },
-            contentColor = if (checked) {
+            contentColor = if (isAlternative) {
                 MaterialTheme.colorScheme.onSecondaryContainer
             } else {
                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -695,27 +1046,14 @@ private fun RemoteSwitcherBubble(
         ),
         contentPadding = PaddingValues(0.dp)
     ) {
-        Column(
+        Box(
             modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+            contentAlignment = Alignment.Center
         ) {
             Icon(
-                imageVector = if (checked) Icons.Filled.Apps else primaryPadMode.icon,
-                contentDescription = "Switch remote pad",
+                imageVector = targetMode.icon,
+                contentDescription = "Switch to ${targetMode.label}",
                 modifier = Modifier.size(iconSize)
-            )
-            Text(
-                text = if (checked) {
-                    "123"
-                } else if (primaryPadMode == RemotePadMode.Touchpad) {
-                    "Touch"
-                } else {
-                    "D-pad"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                textAlign = TextAlign.Center,
-                maxLines = 1
             )
         }
     }
@@ -786,9 +1124,10 @@ private fun KeyboardDialog(
 @Composable
 private fun GoogleTvDPad(
     size: Dp,
+    hapticsEnabled: Boolean,
     onAction: (Remotemessage.RemoteKeyCode) -> Unit,
 ) {
-    val haptics = LocalHapticFeedback.current
+    val view = androidx.compose.ui.platform.LocalView.current
     val scope = rememberCoroutineScope()
     var activeZone by remember { mutableStateOf<DPadZone?>(null) }
     val padScale by animateFloatAsState(
@@ -803,7 +1142,9 @@ private fun GoogleTvDPad(
 
     fun activate(zone: DPadZone, key: Remotemessage.RemoteKeyCode) {
         activeZone = zone
-        haptics.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+        if (hapticsEnabled) {
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+        }
         onAction(key)
         scope.launch {
             delay(160)
@@ -962,13 +1303,14 @@ private fun GoogleTvDPad(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(
-//                            color = MaterialTheme.colorScheme.surfaceContainerHigh
-                                    Brush.radialGradient(
-                                listOf(
-                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.95f),
-                                    MaterialTheme.colorScheme.surface
-                                )
-                            )
+
+                            color = MaterialTheme.colorScheme.outlineVariant
+//                                    Brush.radialGradient(
+//                                listOf(
+//                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.95f),
+//                                    MaterialTheme.colorScheme.surface
+//                                )
+//                            )
                         ),
                     contentAlignment = Alignment.Center
                 ) {
@@ -1095,18 +1437,43 @@ private fun directionalSectorShape(
     addPath(path)
 }
 
+// ── Continuous hold-swipe tuning constants (exposed for easy adjustments) ────
+private object TouchpadConfig {
+    const val LOCK_THRESHOLD_PX = 25f        // px before direction is committed
+    const val NAVIGATION_STEP_PX = 80f       // px of drag = 1 key press
+    const val INITIAL_REPEAT_DELAY_MS = 350L  // delay before repeat starts
+    const val REPEAT_INTERVAL_MS = 160L      // smooth repeat interval
+}
+
 @Composable
 private fun TouchpadPanel(
     width: Dp,
     height: Dp,
+    isConnected: Boolean,
+    hapticsEnabled: Boolean,
     onAction: (Remotemessage.RemoteKeyCode) -> Unit,
 ) {
+    val view = androidx.compose.ui.platform.LocalView.current
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     var isTouchActive by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
     val dotScale by animateFloatAsState(
         targetValue = if (isTouchActive) 1.15f else 1f,
         label = "touchpadDot"
     )
+
+    // Remember continuous swipe repeat job at composable level to cancel it on connection loss
+    var repeatJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    // Cancel running hold-swipe coroutine when connection is lost
+    LaunchedEffect(isConnected) {
+        if (!isConnected) {
+            repeatJob?.cancel()
+            repeatJob = null
+            isTouchActive = false
+            dragOffset = Offset.Zero
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -1136,47 +1503,139 @@ private fun TouchpadPanel(
                         isTouchActive = false
                     },
                     onTap = {
+                        if (hapticsEnabled) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+                        }
                         onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_CENTER)
                     }
                 )
             }
-            .pointerInput(Unit) {
+            .pointerInput(isConnected) {
+                var lockedDirection: Remotemessage.RemoteKeyCode? = null
+                var tempDrag = Offset.Zero
+                var totalDrag = Offset.Zero
+
+                fun fireKey(direction: Remotemessage.RemoteKeyCode) {
+                    if (isConnected) {
+                        if (hapticsEnabled) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+                        }
+                        onAction(direction)
+                    }
+                }
+
+                fun startRepeatCoroutine(direction: Remotemessage.RemoteKeyCode) {
+                    repeatJob?.cancel()
+                    repeatJob = coroutineScope.launch {
+                        delay(TouchpadConfig.INITIAL_REPEAT_DELAY_MS)
+                        while (true) {
+                            fireKey(direction)
+                            delay(TouchpadConfig.REPEAT_INTERVAL_MS)
+                        }
+                    }
+                }
+
                 detectDragGestures(
                     onDragStart = {
-                        dragOffset = Offset.Zero
+                        if (!isConnected) return@detectDragGestures
+                        lockedDirection = null
+                        tempDrag = Offset.Zero
+                        totalDrag = Offset.Zero
                         isTouchActive = true
+                        dragOffset = Offset.Zero
+                        repeatJob?.cancel()
+                        repeatJob = null
                     },
                     onDragCancel = {
+                        repeatJob?.cancel()
+                        repeatJob = null
+                        lockedDirection = null
+                        tempDrag = Offset.Zero
                         dragOffset = Offset.Zero
                         isTouchActive = false
                     },
                     onDragEnd = {
-                        val horizontal = abs(dragOffset.x)
-                        val vertical = abs(dragOffset.y)
-                        val threshold = 54f
-                        when {
-                            horizontal < threshold && vertical < threshold ->
-                                onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_CENTER)
-
-                            horizontal > vertical && dragOffset.x > 0f ->
-                                onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT)
-
-                            horizontal > vertical && dragOffset.x < 0f ->
-                                onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT)
-
-                            dragOffset.y > 0f ->
-                                onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN)
-
-                            else ->
-                                onAction(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_UP)
+                        repeatJob?.cancel()
+                        repeatJob = null
+                        // If no direction was locked (micro-tap), treat as center click
+                        if (lockedDirection == null && kotlin.math.abs(totalDrag.x) < TouchpadConfig.LOCK_THRESHOLD_PX && kotlin.math.abs(totalDrag.y) < TouchpadConfig.LOCK_THRESHOLD_PX) {
+                            fireKey(Remotemessage.RemoteKeyCode.KEYCODE_DPAD_CENTER)
                         }
-
+                        lockedDirection = null
+                        tempDrag = Offset.Zero
                         dragOffset = Offset.Zero
                         isTouchActive = false
                     }
                 ) { change, dragAmount ->
+                    if (!isConnected) {
+                        change.consume()
+                        return@detectDragGestures
+                    }
                     change.consume()
                     dragOffset += dragAmount
+                    totalDrag += dragAmount
+                    tempDrag += dragAmount
+
+                    val ax = kotlin.math.abs(tempDrag.x)
+                    val ay = kotlin.math.abs(tempDrag.y)
+
+                    if (lockedDirection == null) {
+                        // ── Lock initial direction ────────────────────────────────
+                        if (ax >= TouchpadConfig.LOCK_THRESHOLD_PX || ay >= TouchpadConfig.LOCK_THRESHOLD_PX) {
+                            val dir = when {
+                                ax >= ay && tempDrag.x > 0 -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT
+                                ax >= ay && tempDrag.x < 0 -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT
+                                tempDrag.y > 0            -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN
+                                else                        -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_UP
+                            }
+                            lockedDirection = dir
+                            tempDrag = Offset.Zero
+                            fireKey(dir)
+                            startRepeatCoroutine(dir)
+                        }
+                    } else {
+                        // ── Check for direction switch while holding ──────────────
+                        val currentDir = lockedDirection!!
+                        val isOppositeOrDifferent = when (currentDir) {
+                            Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT -> tempDrag.x < 0 && ax >= ay
+                            Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT  -> tempDrag.x > 0 && ax >= ay
+                            Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN  -> tempDrag.y < 0 && ay > ax
+                            else                                            -> tempDrag.y > 0 && ay > ax
+                        } || (ax >= TouchpadConfig.LOCK_THRESHOLD_PX && ax >= ay && (currentDir == Remotemessage.RemoteKeyCode.KEYCODE_DPAD_UP || currentDir == Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN))
+                           || (ay >= TouchpadConfig.LOCK_THRESHOLD_PX && ay > ax && (currentDir == Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT || currentDir == Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT))
+
+                        if (isOppositeOrDifferent) {
+                            if (ax >= TouchpadConfig.LOCK_THRESHOLD_PX || ay >= TouchpadConfig.LOCK_THRESHOLD_PX) {
+                                val newDir = when {
+                                    ax >= ay && tempDrag.x > 0 -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT
+                                    ax >= ay && tempDrag.x < 0 -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT
+                                    tempDrag.y > 0            -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN
+                                    else                        -> Remotemessage.RemoteKeyCode.KEYCODE_DPAD_UP
+                                }
+                                if (newDir != currentDir) {
+                                    lockedDirection = newDir
+                                    tempDrag = Offset.Zero
+                                    fireKey(newDir)
+                                    startRepeatCoroutine(newDir)
+                                }
+                            }
+                        } else {
+                            // If they are moving further in the same direction, keep sensitivity high by zeroing perpendicular drift
+                            val isSameDirection = when (currentDir) {
+                                Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT -> tempDrag.x > 0
+                                Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT  -> tempDrag.x < 0
+                                Remotemessage.RemoteKeyCode.KEYCODE_DPAD_DOWN  -> tempDrag.y > 0
+                                else                                            -> tempDrag.y < 0
+                            }
+                            if (isSameDirection) {
+                                tempDrag = when (currentDir) {
+                                    Remotemessage.RemoteKeyCode.KEYCODE_DPAD_RIGHT,
+                                    Remotemessage.RemoteKeyCode.KEYCODE_DPAD_LEFT  -> Offset(tempDrag.x, 0f)
+                                    else -> Offset(0f, tempDrag.y)
+                                }
+                            }
+                        }
+                    }
                 }
             },
         contentAlignment = Alignment.Center
@@ -1200,7 +1659,7 @@ private fun TouchpadPanel(
                     )
                 }
                 .scale(dotScale)
-                .size(if (isTouchActive) 16.dp else 10.dp)
+                .size(if (isTouchActive) 25.dp else 20.dp)
                 .zIndex(0f)
                 .background(
                     color = if (isTouchActive) {
@@ -1278,6 +1737,34 @@ private fun NumberPadPanel(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PowerRow(
+    onPower: () -> Unit,
+    actionIconSize: Dp
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        FilledTonalIconButton(
+            onClick = onPower,
+            modifier = Modifier.size(54.dp),
+            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f),
+                contentColor = MaterialTheme.colorScheme.onErrorContainer
+            )
+        ) {
+            Icon(
+                imageVector = Icons.Filled.PowerSettingsNew,
+                contentDescription = "Power",
+                modifier = Modifier.size(actionIconSize * 1.1f)
+            )
         }
     }
 }

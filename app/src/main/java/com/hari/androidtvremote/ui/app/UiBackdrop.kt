@@ -19,8 +19,22 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.unit.dp
 
+import com.hari.androidtvremote.preference.LocalAmoledDarkTheme
+
 @Composable
 fun AppBackdrop(content: @Composable () -> Unit) {
+    val isOled = LocalAmoledDarkTheme.current.value
+    if (isOled) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            content()
+        }
+        return
+    }
+
     val transition = rememberInfiniteTransition(label = "backdrop")
     val primaryDrift = transition.animateFloat(
         initialValue = -28f,

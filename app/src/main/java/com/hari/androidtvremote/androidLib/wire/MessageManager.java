@@ -1,16 +1,20 @@
 package com.hari.androidtvremote.androidLib.wire;
 
-import android.util.Log;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.nio.ByteBuffer;
 
 public abstract class MessageManager {
 
     private final Logger logger = LoggerFactory.getLogger(MessageManager.class);
-    public ByteBuffer mPacketBuffer = ByteBuffer.allocate(65539);
+
+    private static int getVarintSize(int value) {
+        int size = 0;
+        do {
+            size++;
+            value >>>= 7;
+        } while (value != 0);
+        return size;
+    }
 
     /**
      * Encode a length as a varint (little-endian, 7 bits per byte, MSB=1 means "more bytes follow").
@@ -20,15 +24,15 @@ public abstract class MessageManager {
      * a voice payload is ~649 bytes. (byte)649 wraps to 137, so the TV received a
      * 137-byte frame followed by 512 bytes of garbage → connection reset.
      */
-    private static void writeVarint(ByteBuffer buf, int value) {
+    private static int writeVarint(byte[] buf, int offset, int value) {
         while (true) {
             if ((value & ~0x7F) == 0) {
                 // Last (or only) byte — MSB=0
-                buf.put((byte) value);
-                return;
+                buf[offset++] = (byte) value;
+                return offset;
             } else {
                 // More bytes to come — write 7 bits with MSB=1
-                buf.put((byte) ((value & 0x7F) | 0x80));
+                buf[offset++] = (byte) ((value & 0x7F) | 0x80);
                 value >>>= 7;
             }
         }
@@ -36,12 +40,13 @@ public abstract class MessageManager {
 
     public byte[] addLengthAndCreate(byte[] message) {
         int length = message.length;
-        Log.d("MessageManager", String.valueOf(length));
-        writeVarint(mPacketBuffer, length);
-        mPacketBuffer.put(message);
-        byte[] buf = new byte[mPacketBuffer.position()];
-        System.arraycopy(mPacketBuffer.array(), mPacketBuffer.arrayOffset(), buf, 0, mPacketBuffer.position());
-        mPacketBuffer.clear();
+        if (logger.isDebugEnabled()) {
+            logger.debug(String.valueOf(length));
+        }
+        int varintSize = getVarintSize(length);
+        byte[] buf = new byte[varintSize + length];
+        writeVarint(buf, 0, length);
+        System.arraycopy(message, 0, buf, varintSize, length);
         return buf;
     }
 }

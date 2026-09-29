@@ -23,6 +23,8 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
 
     private RemoteSession mRemoteSession;
 
+    private volatile String mLastHost;
+
     private final List<AndroidTvListener> mListeners = new ArrayList<>();
 
     public void addListener(AndroidTvListener listener) {
@@ -76,6 +78,7 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
     public void connect(String host, AndroidTvListener androidTvListener)
             throws GeneralSecurityException, IOException, InterruptedException, PairingException {
 
+        mLastHost = host;
         if (androidTvListener != null) {
             addListener(androidTvListener);
         }
@@ -157,14 +160,43 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
         });
     }
 
+    public boolean isSocketAlive() {
+        return mRemoteSession != null && mRemoteSession.isSocketAlive();
+    }
+
+    public boolean sendPing() {
+        if (mRemoteSession != null) {
+            return mRemoteSession.sendPing();
+        }
+        return false;
+    }
+
+    public synchronized void ensureConnected() {
+        if (isSocketAlive()) {
+            return;
+        }
+        if (mRemoteSession != null) {
+            mRemoteSession.attemptToReconnect();
+        }
+    }
+
     public void sendCommand(Remotemessage.RemoteKeyCode remoteKeyCode, Remotemessage.RemoteDirection remoteDirection) {
         Log.i("AndroidRemoteTv", "sendCommand : " + remoteKeyCode + "  " + remoteDirection);
-        mRemoteSession.sendCommand(remoteKeyCode, remoteDirection);
+        if (mRemoteSession != null) {
+            mRemoteSession.sendCommand(remoteKeyCode, remoteDirection);
+        } else {
+            Log.w("AndroidRemoteTv", "sendCommand: mRemoteSession is null — triggering ensureConnected");
+            ensureConnected();
+        }
     }
 
     public void sendAppLink(String appLink) {
         Log.i("AndroidRemoteTv", "appLink : " + appLink);
-        mRemoteSession.sendAppCommand(appLink);
+        if (mRemoteSession != null) {
+            mRemoteSession.sendAppCommand(appLink);
+        } else {
+            ensureConnected();
+        }
     }
 
     public void sendMessage(Remotemessage.RemoteMessage message) {
@@ -176,11 +208,19 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
 
     public void sendText(String text, int imeCounter, int fieldCounter) {
         Log.i("AndroidRemoteTv", "sendText: \"" + text + "\"");
-        mRemoteSession.sendText(text, imeCounter, fieldCounter);
+        if (mRemoteSession != null) {
+            mRemoteSession.sendText(text, imeCounter, fieldCounter);
+        } else {
+            ensureConnected();
+        }
     }
 
     public void sendImeEnter() {
-        mRemoteSession.sendImeEnter();
+        if (mRemoteSession != null) {
+            mRemoteSession.sendImeEnter();
+        } else {
+            ensureConnected();
+        }
     }
 
     public void sendSecret(String code) {
@@ -188,15 +228,45 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
     }
 
     public void abort() {
-        stopVoice();
-        if (mRemoteSession != null)
-            mRemoteSession.abort();
-        if (mPairingSession != null)
-            mPairingSession.abort();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    stopVoice();
+                } catch (Exception e) {
+                    Log.e("AndroidRemoteTv", "Error in stopVoice on abort", e);
+                }
+                if (mRemoteSession != null) {
+                    try {
+                        mRemoteSession.abort();
+                    } catch (Exception e) {
+                        Log.e("AndroidRemoteTv", "Error in mRemoteSession.abort", e);
+                    }
+                }
+                if (mPairingSession != null) {
+                    try {
+                        mPairingSession.abort();
+                    } catch (Exception e) {
+                        Log.e("AndroidRemoteTv", "Error in mPairingSession.abort", e);
+                    }
+                }
+            }
+        }).start();
     }
 
     public void reconnect(String host, AndroidTvListener androidTvListener)
             throws GeneralSecurityException, IOException, InterruptedException, PairingException {
+
+        mLastHost = host;
+        // ── FIX: Tear down any lingering socket/threads from the previous session
+        // BEFORE replacing mRemoteSession.  Without this, the old RemoteSession's
+        // reader thread and SSLSocket are orphaned — they stay alive indefinitely,
+        // holding the port open and consuming resources.
+        if (mRemoteSession != null) {
+            try { mRemoteSession.abort(); } catch (Exception ignored) {}
+            mRemoteSession = null;
+        }
+
         mRemoteSession = new RemoteSession(host, 6466, new RemoteSession.RemoteSessionListener() {
             @Override
             public void onConnected() {
@@ -205,12 +275,20 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
 
             @Override
             public void onSslError() {
-
+                // SSL error during reconnect — treat as a hard error so the ViewModel
+                // can fall back to Discovery instead of staying stuck.
+                androidTvListener.onError("SSL certificate error. Re-pair the device.");
             }
 
             @Override
             public void onDisconnected() {
-
+                // ── FIX: was an empty method. The ViewModel's reconnect listener
+                // (createRemoteListener) checked isActiveConnection() and called
+                // handleDeviceDisconnected() only if this callback fired.
+                // Without this, a failed TLS reconnect left the ViewModel believing
+                // the device was still connecting, with autoReconnectInFlight permanently
+                // stuck at true and isConnecting never cleared.
+                androidTvListener.onDisconnect();
             }
 
             @Override
@@ -223,13 +301,28 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
 
             @Override
             public void onError(String message) {
-
+                // ── FIX: was an empty method. Errors during reconnect (e.g. network
+                // unreachable, handshake timeout) were silently dropped, causing the
+                // same permanent stuck-connecting state.
+                androidTvListener.onError(message);
             }
 
         });
 
+        if (mVolumeChangedCallback != null) {
+            mRemoteSession.setVolumeListener((level, maxLevel, muted) -> {
+                mVolumeLevel  = level;
+                mVolumeMax    = maxLevel;
+                mVolumeMuted  = muted;
+                if (mVolumeChangedCallback != null) {
+                    mVolumeChangedCallback.onVolumeChanged(level, maxLevel, muted);
+                }
+            });
+        }
+
         mRemoteSession.connect();
     }
+
 
     public void disconnect(String host, AndroidTvListener androidTvListener)
             throws GeneralSecurityException, IOException, InterruptedException, PairingException {
@@ -297,8 +390,19 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
         int sessionId = mRemoteSession.startVoice();
         if (sessionId < 0) return false;
 
-        mVoiceManager = new VoiceManager(pcmChunk ->
-                mRemoteSession.sendVoiceChunk(pcmChunk)
+        mVoiceManager = new VoiceManager(
+                pcmChunk -> {
+                    if (mRemoteSession != null) {
+                        mRemoteSession.sendVoiceChunk(pcmChunk);
+                    }
+                },
+                () -> {
+                    Log.i("AndroidRemoteTv", "Voice VAD auto-stop triggered");
+                    stopVoice();
+                    if (mVoiceAutoStopCallback != null) {
+                        mVoiceAutoStopCallback.onAutoStop();
+                    }
+                }
         );
 
         boolean micStarted = mVoiceManager.startRecording();
@@ -309,6 +413,16 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
         }
 
         return true;
+    }
+
+    public interface VoiceAutoStopCallback {
+        void onAutoStop();
+    }
+
+    private volatile VoiceAutoStopCallback mVoiceAutoStopCallback;
+
+    public void setVoiceAutoStopCallback(VoiceAutoStopCallback callback) {
+        mVoiceAutoStopCallback = callback;
     }
 
     /**
@@ -412,5 +526,6 @@ public class AndroidRemoteTv extends BaseAndroidRemoteTv {
     // Getters for one-shot reads
     public int  getCurrentVolume()  { return mVolumeLevel; }
     public int  getMaxVolume()      { return mVolumeMax;   }
+    public boolean isMuted()        { return mVolumeMuted; }
 
 }

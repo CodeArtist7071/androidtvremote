@@ -21,6 +21,7 @@ enum class HomeTab(val label: String, val icon: ImageVector) {
 enum class RemotePadMode(val label: String, val icon: ImageVector) {
     Touchpad("Touchpad", Icons.Filled.TouchApp),
     DPad("D-pad", Icons.Filled.GridView),
+    // NumberPad is intentionally disabled and may be reintroduced in a future release.
     NumberPad("Number", Icons.Filled.Apps)
 }
 
@@ -77,9 +78,17 @@ fun RemotePadMode.next(): RemotePadMode {
 }
 
 fun RemotePadMode.primaryMode(): RemotePadMode = when (this) {
-    RemotePadMode.NumberPad -> RemotePadMode.Touchpad
+    RemotePadMode.NumberPad -> RemotePadMode.DPad
     else -> this
 }
 
-fun RemotePadMode.toggleNumberPad(primaryMode: RemotePadMode): RemotePadMode =
-    if (this == RemotePadMode.NumberPad) primaryMode.primaryMode() else RemotePadMode.NumberPad
+/**
+ * Toggles between [RemotePadMode.DPad] and [RemotePadMode.Touchpad] only.
+ * Number pad is intentionally disabled and may be reintroduced in a future release.
+ */
+fun RemotePadMode.toggleNumberPad(primaryMode: RemotePadMode): RemotePadMode = when (this) {
+    RemotePadMode.DPad -> RemotePadMode.Touchpad
+    RemotePadMode.Touchpad -> RemotePadMode.DPad
+    // NumberPad is intentionally disabled — fall back to DPad.
+    RemotePadMode.NumberPad -> RemotePadMode.DPad
+}

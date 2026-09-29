@@ -12,4 +12,8 @@ sealed class Screen(val route: String) {
     data object Appearance : Screen("appearance")
     data object TipsSupport : Screen("tips_support")
     data object CastPlayer : Screen("cast_player")
+    data object ManageShortcuts : Screen("manage_shortcuts")
+    data object QuickLaunchOrder : Screen("quick_launch_order")
+    data object CustomizeLayout : Screen("customize_layout")
+    data object Donation : Screen("donation")
 }

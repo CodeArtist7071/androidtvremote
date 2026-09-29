@@ -6,6 +6,9 @@ import android.net.Uri
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cast
@@ -51,7 +55,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import com.hari.androidtvremote.BuildConfig
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
@@ -60,6 +63,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.hari.androidtvremote.androidLib.remote.Remotemessage
 import kotlinx.coroutines.launch
 
@@ -101,22 +105,20 @@ fun HomeScreen(
     onKeyboardEnter: () -> Unit,
     onToggleVoice: () -> Unit,
     onOpenCastPlayer: (MediaItemUi) -> Unit,
+    onClearStatus: () -> Unit,
     onUserRated: () -> Unit = {},
     onUserFeedbackClicked: () -> Unit = {},
     onDismissRatingPrompt: () -> Unit = {}
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    val haptics = LocalHapticFeedback.current
+    val view = androidx.compose.ui.platform.LocalView.current
 
-    LaunchedEffect(sessionState.statusMessage, sessionState.isError) {
-        val message = sessionState.statusMessage ?: return@LaunchedEffect
-        snackbarHostState.showSnackbar(message, duration = SnackbarDuration.Short)
-    }
+    // Connection status is shown in the toolbar subtitle; no snackbar needed.
 
     fun performHaptic() {
         if (hapticsEnabled) {
-            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
         }
     }
 
@@ -146,18 +148,45 @@ fun HomeScreen(
                         titleContentColor = MaterialTheme.colorScheme.onSurface
                     ),
                     title = {
-                        Column {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            val titleText = when {
+                                sessionState.isConnecting -> "Connecting..."
+                                sessionState.connectedDevice != null -> sessionState.connectedDevice.name
+                                else -> "Android TV Remote"
+                            }
+                            val dotColor = when {
+                                sessionState.connectedDevice != null -> Color(0xFF4CAF50)
+                                sessionState.isConnecting -> Color(0xFFFFB300)
+                                else -> Color(0xFFE53935)
+                            }
+
                             Text(
-                                text = sessionState.connectedDevice?.name ?: "Android TV Remote",
-                                style = MaterialTheme.typography.headlineSmall
+                                text = titleText,
+                                fontSize = 17.sp,
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .background(dotColor, CircleShape)
                             )
                         }
                     },
                     actions = {
                         IconButton(
-                            onClick = { handleRemoteAction(onPower) }
+                            onClick = { handleRemoteAction(onPower) },
+                            enabled = true
                         ) {
-                            Icon(Icons.Filled.PowerSettingsNew, contentDescription = "Power")
+                            Icon(
+                                imageVector = Icons.Filled.PowerSettingsNew,
+                                contentDescription = "Power",
+                                tint = if (sessionState.connectedDevice != null)
+                                    MaterialTheme.colorScheme.onSurface
+                                else
+                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                            )
                         }
                         IconButton(onClick = onOpenDiscovery) {
                             Icon(
@@ -235,42 +264,25 @@ fun HomeScreen(
         ) { innerPadding ->
             Crossfade(targetState = currentTab, label = "tabContent") { tab ->
                 when (tab) {
-                    HomeTab.Remote -> RemoteScreen(
-                        modifier = Modifier.padding(innerPadding),
-                        activePadMode = activePadMode,
-                        defaultPadMode = defaultPadMode,
-                        sessionState = sessionState,
-                        remoteShelfMode = remoteShelfMode,
-                        quickApps = remoteApps,
-                        onRequireConnection = onOpenDiscovery,
-                        onCyclePadMode = onCyclePadMode,
-                        onQuickApp = { appName -> handleRemoteAction { onQuickApp(appName) } },
-                        onRemoteKey = { key -> handleRemoteAction { onRemoteKey(key) } },
-                        onVolumeUp = { handleRemoteAction(onVolumeUp) },
-                        onVolumeDown = { handleRemoteAction(onVolumeDown) },
-                        onKeyboardText = { text ->
-                            if (sessionState.connectedDevice != null) {
-                                onKeyboardText(text)
-                            } else {
-                                onOpenDiscovery()
-                            }
-                        },
-                        onKeyboardBackspace = { count ->
-                            if (sessionState.connectedDevice != null) {
-                                onKeyboardBackspace(count)
-                            } else {
-                                onOpenDiscovery()
-                            }
-                        },
-                        onKeyboardEnter = {
-                            if (sessionState.connectedDevice != null) {
-                                onKeyboardEnter()
-                            } else {
-                                onOpenDiscovery()
-                            }
-                        },
-                        onToggleVoice = { handleRemoteAction(onToggleVoice) }
-                    )
+                      HomeTab.Remote -> RemoteScreen(
+                         modifier = Modifier.padding(innerPadding),
+                         activePadMode = activePadMode,
+                         defaultPadMode = defaultPadMode,
+                         sessionState = sessionState,
+                         remoteShelfMode = remoteShelfMode,
+                         quickApps = remoteApps,
+                         hapticsEnabled = hapticsEnabled,
+                         onRequireConnection = onOpenDiscovery,
+                         onCyclePadMode = onCyclePadMode,
+                         onQuickApp = onQuickApp,
+                         onRemoteKey = onRemoteKey,
+                         onVolumeUp = onVolumeUp,
+                         onVolumeDown = onVolumeDown,
+                         onKeyboardText = onKeyboardText,
+                         onKeyboardBackspace = onKeyboardBackspace,
+                         onKeyboardEnter = onKeyboardEnter,
+                         onToggleVoice = onToggleVoice
+                     )
 
                     HomeTab.Cast -> CastScreen(
                         modifier = Modifier.padding(innerPadding),
