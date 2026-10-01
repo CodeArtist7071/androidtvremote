@@ -2,8 +2,21 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.parcelize)
-    alias(libs.plugins.google.services)
-    alias(libs.plugins.firebase.crashlytics)
+    alias(libs.plugins.google.services) apply false
+    alias(libs.plugins.firebase.crashlytics) apply false
+}
+
+// Firebase configuration is project-specific and intentionally not committed.
+// Apply its Gradle plugins only for builds that have a local config file.
+val hasGoogleServicesConfig = listOf(
+    "google-services.json",
+    "src/google-services.json",
+    "src/debug/google-services.json",
+    "src/release/google-services.json"
+).any { file(it).isFile }
+if (hasGoogleServicesConfig) {
+    apply(plugin = "com.google.gms.google-services")
+    apply(plugin = "com.google.firebase.crashlytics")
 }
 
 android {
@@ -42,6 +55,10 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    defaultConfig {
+        buildConfigField("boolean", "FIREBASE_CONFIGURED", hasGoogleServicesConfig.toString())
     }
 
     lint {

@@ -2,11 +2,16 @@ package com.hari.androidtvremote.utils
 
 import android.content.Context
 import android.os.Bundle
+import com.hari.androidtvremote.BuildConfig
 import com.google.firebase.analytics.FirebaseAnalytics
 
 class AnalyticsHelper private constructor(context: Context) {
 
-    private val firebaseAnalytics = FirebaseAnalytics.getInstance(context)
+    private val firebaseAnalytics = if (BuildConfig.FIREBASE_CONFIGURED) {
+        FirebaseAnalytics.getInstance(context)
+    } else {
+        null
+    }
 
     companion object {
         @Volatile
@@ -24,11 +29,11 @@ class AnalyticsHelper private constructor(context: Context) {
             putString(FirebaseAnalytics.Param.SCREEN_NAME, screenName)
             putString(FirebaseAnalytics.Param.SCREEN_CLASS, screenClass)
         }
-        firebaseAnalytics.logEvent(FirebaseAnalytics.Event.SCREEN_VIEW, bundle)
+        firebaseAnalytics?.logEvent(FirebaseAnalytics.Event.SCREEN_VIEW, bundle)
     }
 
     fun logEvent(eventName: String, params: Bundle? = null) {
-        firebaseAnalytics.logEvent(eventName, params)
+        firebaseAnalytics?.logEvent(eventName, params)
     }
 
     fun logDeviceConnection(deviceName: String, success: Boolean, errorMsg: String? = null) {
@@ -39,7 +44,7 @@ class AnalyticsHelper private constructor(context: Context) {
                 putString("error_message", errorMsg)
             }
         }
-        firebaseAnalytics.logEvent("device_connection", bundle)
+        firebaseAnalytics?.logEvent("device_connection", bundle)
     }
 
     fun logCastMedia(mediaType: String, success: Boolean) {
@@ -47,7 +52,7 @@ class AnalyticsHelper private constructor(context: Context) {
             putString("media_type", mediaType)
             putBoolean("success", success)
         }
-        firebaseAnalytics.logEvent("cast_media", bundle)
+        firebaseAnalytics?.logEvent("cast_media", bundle)
     }
 
 }

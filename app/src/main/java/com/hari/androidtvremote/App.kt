@@ -40,8 +40,10 @@ class App : Application() {
 
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())
-        } else {
+        } else if (BuildConfig.FIREBASE_CONFIGURED) {
             Timber.plant(CrashlyticsTree())
+        } else {
+            Timber.plant(Timber.DebugTree())
         }
 
         // Init must happen on main thread (reads application context only)
